@@ -11,7 +11,7 @@ import { resetRateLimit } from "@/lib/rate-limit";
 vi.mock("@/lib/prisma", () => ({
   prisma: {
     user: {
-      findUnique: vi.fn(),
+      findFirst: vi.fn(),
     },
   },
 }));
@@ -86,7 +86,7 @@ describe("GET /api/badge/[username]", () => {
   });
 
   it("returns 404 when user does not exist", async () => {
-    vi.mocked(prisma.user.findUnique).mockResolvedValue(null);
+    vi.mocked(prisma.user.findFirst).mockResolvedValue(null);
     const sig = signBadge("nobody");
     const req = createBadgeRequest("nobody", sig);
     const res = await getBadge(req, { params: { username: "nobody" } });
@@ -94,7 +94,7 @@ describe("GET /api/badge/[username]", () => {
   });
 
   it("returns 404 when registration is private (profilePublic=false)", async () => {
-    vi.mocked(prisma.user.findUnique).mockResolvedValue({
+    vi.mocked(prisma.user.findFirst).mockResolvedValue({
       githubUsername: "alice",
       registration: { ...readyRegistration, profilePublic: false },
     } as any);
@@ -105,7 +105,7 @@ describe("GET /api/badge/[username]", () => {
   });
 
   it("returns 404 when registration is soft-deleted", async () => {
-    vi.mocked(prisma.user.findUnique).mockResolvedValue({
+    vi.mocked(prisma.user.findFirst).mockResolvedValue({
       githubUsername: "alice",
       registration: { ...readyRegistration, deletedAt: new Date() },
     } as any);
@@ -121,11 +121,39 @@ describe("GET /api/badge/[username]", () => {
     const req = createBadgeRequest(invalidUsername, sig);
     const res = await getBadge(req, { params: { username: invalidUsername } });
     expect(res.status).toBe(404);
-    expect(prisma.user.findUnique).not.toHaveBeenCalled();
+    expect(prisma.user.findFirst).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 for non-ASCII/homoglyph usernames without querying", async () => {
+    const invalidUsername = "\u0430lice";
+    const req = createBadgeRequest(invalidUsername, signBadge(invalidUsername));
+    const res = await getBadge(req, { params: { username: invalidUsername } });
+    expect(res.status).toBe(404);
+    expect(prisma.user.findFirst).not.toHaveBeenCalled();
+  });
+
+  it("canonicalizes @Alice / spaced / uppercase usernames for signature and lookup", async () => {
+    vi.mocked(prisma.user.findFirst).mockResolvedValue({
+      githubUsername: "alice",
+      registration: readyRegistration,
+    } as any);
+    const sig = signBadge("alice");
+
+    for (const raw of ["@Alice", " Alice ", "ALICE"]) {
+      const req = createBadgeRequest(raw, sig);
+      const res = await getBadge(req, { params: { username: raw } });
+      expect(res.status).toBe(200);
+      expect(prisma.user.findFirst).toHaveBeenLastCalledWith({
+        where: {
+          githubUsername: { equals: "alice", mode: "insensitive" },
+        },
+        select: expect.any(Object),
+      });
+    }
   });
 
   it("returns 200 OK + SVG badge for valid signature and opt-in public profile", async () => {
-    vi.mocked(prisma.user.findUnique).mockResolvedValue({
+    vi.mocked(prisma.user.findFirst).mockResolvedValue({
       githubUsername: "alice",
       registration: readyRegistration,
     } as any);
@@ -148,7 +176,7 @@ describe("GET /api/badge/[username]", () => {
   });
 
   it("returns 200 OK with valid unexpired exp parameter", async () => {
-    vi.mocked(prisma.user.findUnique).mockResolvedValue({
+    vi.mocked(prisma.user.findFirst).mockResolvedValue({
       githubUsername: "alice",
       registration: readyRegistration,
     } as any);
@@ -162,7 +190,7 @@ describe("GET /api/badge/[username]", () => {
   });
 
   it("returns 429 when rate limit (30 req/min) is exceeded", async () => {
-    vi.mocked(prisma.user.findUnique).mockResolvedValue({
+    vi.mocked(prisma.user.findFirst).mockResolvedValue({
       githubUsername: "alice",
       registration: readyRegistration,
     } as any);

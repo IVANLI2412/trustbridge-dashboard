@@ -102,6 +102,8 @@ export type AuditAction =
   | "recheck.self_service"
   | "registration.create"
   | "registration.update"
+  | "registration.delete"
+  | "registration.restore"
   | "checklist.update"
   | "network_config_mismatch_detected"
   | "contract.sync"

@@ -146,6 +146,13 @@ DATABASE_URL="postgresql://trustbridge:trustbridge-dev-password@localhost:5432/t
 - **Horizon rate limits** — batch re-check queries one account per registration; large Waves may need throttling (future enhancement)
 - **Vercel serverless timeout** — default 10s on Hobby; batch re-check may need pagination for 100+ contributors
 - **Database connections** — use connection pooling (Neon pooler, Supabase pooler, or Prisma Accelerate)
+- **Load scenarios** — before opening a Wave or an organic registration spike,
+  run the k6 scenarios in [docs/PERFORMANCE_TESTING.md](./PERFORMANCE_TESTING.md):
+  `npm run test:k6` (`/api/check`), `npm run test:k6:treasury` (payout exports and
+  paginated contributor reads), and `npm run test:k6:registration` (registration
+  spikes plus paginated reads). The last one needs contributor and maintainer
+  session cookies exported in the shell, a non-public Horizon fixture, and a
+  roster outside the freeze window. Never point these scripts at production.
 
 ---
 

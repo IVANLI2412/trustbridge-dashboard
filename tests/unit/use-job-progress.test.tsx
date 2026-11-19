@@ -99,6 +99,39 @@ describe("useJobProgress hook", () => {
     expect(es.closed).toBe(true);
   });
 
+  it("exposes batch progress fields without closing the stream", () => {
+    const { result } = renderHook(() => useJobProgress());
+
+    act(() => {
+      result.current.startProgress("job-123");
+    });
+    const es = MockEventSource.instances[0];
+
+    act(() => {
+      es.simulateMessage({
+        type: "progress",
+        jobId: "job-123",
+        processed: 3,
+        total: 10,
+        errors: 1,
+        done: false,
+        updatedAt: "2026-10-01T00:00:00.000Z",
+      });
+    });
+
+    expect(result.current.event).toMatchObject({
+      type: "progress",
+      jobId: "job-123",
+      processed: 3,
+      total: 10,
+      errors: 1,
+      done: false,
+      updatedAt: "2026-10-01T00:00:00.000Z",
+    });
+    expect(result.current.isStreaming).toBe(true);
+    expect(es.closed).toBe(false);
+  });
+
   it("handles disconnect and enters reconnecting state", () => {
     const { result } = renderHook(() =>
       useJobProgress({ maxReconnectAttempts: 3, reconnectDelayMs: 500 })

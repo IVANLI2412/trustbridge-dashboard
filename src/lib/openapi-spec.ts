@@ -411,7 +411,7 @@ export function generateOpenAPISpec(
         get: {
           operationId: "streamQueueJobProgress",
           summary: "Stream progress for a background job",
-          description: "Returns Server-Sent Events with status, processing, completed, failed, or error events. The job must be visible to the authenticated maintainer.",
+          description: "Returns Server-Sent Events with status, progress, processing, completed, failed, or error events. The job must be visible to the authenticated maintainer. A progress event is emitted when a new snapshot is persisted while the job is processing: { type: 'progress', jobId, processed, total, errors, done, updatedAt }. Snapshots are deduplicated by updatedAt; jobs with no progress keep the original status → processing → completed/failed sequence.",
           tags: ["Queue"],
           security: [{ bearerAuth: [] }],
           parameters: [
@@ -584,7 +584,7 @@ export function generateOpenAPISpec(
             },
             "403": { description: "Forbidden: maintainer access required" },
             "404": { description: "Registration not found" },
-            "409": { description: "Registration is not deleted" },
+            "409": { description: "Stellar address is already actively registered" },
           },
         },
       },

@@ -39,7 +39,7 @@ interface RestoreResponse {
  * restore them after confirmation. (#310)
  *
  * Calls:
- *   GET  /api/registrations/deleted            — list up to 50 recent deletes
+ *   GET  /api/registrations/deleted            — list recent deletes (25 by default, 100 max)
  *   POST /api/registrations/:id/restore        — restore one by id (CSRF + RBAC)
  *
  * An audit log entry is written server-side on every successful restore.

@@ -57,6 +57,51 @@ trustbridge-dash recheck --all
 trustbridge-dash recheck --username octocat
 ```
 
+### Batch recheck progress stream
+
+`POST /api/contributors` enqueues a `recheck.batch` job; monitor it with
+`GET /api/contributors/queue/progress?jobId=<id>` (maintainer session required,
+`text/event-stream`). Events arrive in this order:
+
+1. `status` — initial snapshot (`jobId`, `status`, `createdAt`, `startedAt`).
+2. `progress` — zero or more snapshots while the job is processing.
+3. `processing` — heartbeat on each poll while still running.
+4. `completed` or `failed` — terminal event (or `error` for a missing/foreign job).
+
+Jobs with no persisted progress produce only `status` → `processing` → terminal
+events, so existing consumers are unaffected. Snapshots are deduplicated by
+`updatedAt`; only strictly newer timestamps are emitted.
+
+The stable progress payload is:
+
+```json
+{
+  "type": "progress",
+  "jobId": "job-42",
+  "processed": 12,
+  "total": 40,
+  "errors": 1,
+  "done": false,
+  "updatedAt": "2026-10-01T00:00:00.000Z"
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `type` | Always `"progress"` |
+| `jobId` | Id of the background queue job |
+| `processed` | Number of contributor checks completed so far |
+| `total` | Total contributor checks in the batch |
+| `errors` | Number of checks that failed (counted from results) |
+| `done` | `true` once every check has been recorded |
+| `updatedAt` | Monotonic ISO-8601 timestamp, used for dedupe/reconnect |
+
+The worker persists each snapshot in the queue job's existing `result` column
+under `result.progress` while the job is `processing`. The final `result`
+overwrites that field entirely, so the completed-job result shape is unchanged.
+`useJobProgress()` (`src/lib/use-job-progress.ts`) exposes the event fields to
+the dashboard without closing the stream on `progress`.
+
 ### Security & Protocol Constraints
 - **HTTPS Enforcement**: Unencrypted HTTP (`http://`) endpoints are strictly rejected by the CLI to protect API keys and contributor information.
 - **Log Masking**: API keys and tokens are never printed in full to logs or error outputs.

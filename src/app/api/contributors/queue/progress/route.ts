@@ -1,6 +1,7 @@
 import { NextRequest } from "next/server";
 
 import { requireMaintainerSession } from "@/lib/api-auth";
+import { parseJobProgressEvent } from "@/lib/batch-verify";
 import { backgroundQueue } from "@/lib/queue-worker";
 
 export const runtime = "nodejs";
@@ -30,11 +31,20 @@ export async function GET(request: NextRequest) {
 
   const stream = new ReadableStream({
     async start(controller) {
-      function sendEvent(data: Record<string, unknown>) {
+      function sendEvent(data: object) {
         if (!isActive) return;
         controller.enqueue(
           encoder.encode("data: " + JSON.stringify(data) + "\n\n")
         );
+      }
+
+      let lastProgressUpdatedAt: string | null = null;
+      function sendProgress(job: { id: string; result?: Record<string, unknown> }) {
+        const progress = parseJobProgressEvent(job.result?.progress);
+        if (!progress) return;
+        if (lastProgressUpdatedAt && progress.updatedAt <= lastProgressUpdatedAt) return;
+        lastProgressUpdatedAt = progress.updatedAt;
+        sendEvent(progress);
       }
 
       // Verify job exists and belongs to the user
@@ -58,6 +68,7 @@ export async function GET(request: NextRequest) {
         createdAt: job.createdAt.toISOString(),
         startedAt: job.startedAt?.toISOString() ?? null,
       });
+      sendProgress(job);
 
       // Poll for updates
       while (isActive) {
@@ -66,6 +77,8 @@ export async function GET(request: NextRequest) {
           sendEvent({ type: "error", message: "Job not found" });
           break;
         }
+
+        sendProgress(currentJob);
 
         if (currentJob.status === "completed") {
           sendEvent({

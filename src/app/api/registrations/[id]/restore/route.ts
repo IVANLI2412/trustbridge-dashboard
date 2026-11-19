@@ -22,7 +22,13 @@ export async function POST(
   }
 
   const registration = await prisma.registration.findFirst({
-    where: { id: params.id, deletedAt: { not: null } },
+    where: {
+      id: params.id,
+      deletedAt: { not: null },
+      ...(session.user.maintainerOrgId
+        ? { maintainerOrgId: session.user.maintainerOrgId }
+        : {}),
+    },
   });
   if (!registration) {
     return NextResponse.json(

@@ -288,6 +288,11 @@ export interface RefreshAllSummary {
   errors: RefreshAllError[];
 }
 
+export interface RecheckProgressItem {
+  registrationId: string;
+  error?: string;
+}
+
 /**
  * Number of registrations rechecked concurrently by `refreshAllContributors`.
  * Bounded so a large contributor base can't fan out into an unbounded burst
@@ -310,7 +315,8 @@ function getBatchConcurrency(): number {
  */
 async function recheckAllWithConcurrency(
   registrations: Registration[],
-  concurrency: number
+  concurrency: number,
+  onProgress?: (item: RecheckProgressItem) => void | Promise<void>
 ): Promise<{ diffs: ReadinessDiff[]; errors: RefreshAllError[] }> {
   const diffs: ReadinessDiff[] = [];
   const errors: RefreshAllError[] = [];
@@ -321,15 +327,15 @@ async function recheckAllWithConcurrency(
       const registration = queue.shift();
       if (!registration) break;
 
+      let failure: string | undefined;
       try {
         const { diff } = await recheckRegistration(registration);
         diffs.push(diff);
       } catch (error) {
-        errors.push({
-          registrationId: registration.id,
-          message: error instanceof Error ? error.message : "Unknown error",
-        });
+        failure = error instanceof Error ? error.message : 'Unknown error';
+        errors.push({ registrationId: registration.id, message: failure });
       }
+      await onProgress?.({ registrationId: registration.id, error: failure });
     }
   }
 
@@ -342,14 +348,17 @@ async function recheckAllWithConcurrency(
   return { diffs, errors };
 }
 
-export async function refreshAllContributors(): Promise<RefreshAllSummary> {
+export async function refreshAllContributors(
+  onProgress?: (item: RecheckProgressItem) => void | Promise<void>
+): Promise<RefreshAllSummary> {
   const registrations = await prisma.registration.findMany({
     where: { deletedAt: null },
   });
 
   const { diffs, errors } = await recheckAllWithConcurrency(
     registrations,
-    getBatchConcurrency()
+    getBatchConcurrency(),
+    onProgress
   );
 
   return {

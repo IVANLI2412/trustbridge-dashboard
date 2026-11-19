@@ -1,38 +1,81 @@
-# Registration Data Retention
+# Registration data retention and soft-delete lifecycle
 
-This document describes how TrustBridge Dashboard handles registration payloads,
-including validation, storage, and retention of the fields collected during the
-registration flow (`src/app/register/RegisterClient.tsx` → `src/app/api/register/route.ts`).
+This document describes the registration payload TrustBridge stores, how a
+registration is soft-deleted, how maintainers find and restore it, and what is
+written to the audit log.
 
-## Registration payload fields
+## What is actually stored
 
-Registration requests are validated against shared Zod schemas defined in
-`src/lib/` so that the API route and the client form enforce identical rules.
-The validated fields are:
+The registration form (`src/app/register/RegisterClient.tsx`) submits a single
+field to `POST /api/register`:
 
-| Field           | Validation summary                                              |
-| --------------- | -------------------------------------------------------------- |
-| `email`         | Required, trimmed, lowercased, valid email format, max length. |
-| `username`      | Required, trimmed, allowed characters, min/max length.         |
-| `walletAddress` | Required, trimmed, expected address format.                    |
-| `inviteCode`    | Optional, trimmed, expected format when provided.              |
+```json
+{ "stellarAddress": "G..." }
+```
 
-Invalid payloads are rejected by the API with a `400` response containing
-field-level error messages. Auth, CSRF, and rate-limit gates run before payload
-validation and are unaffected by these checks.
+`validateRegistrationInput()` (`src/lib/register-validation.ts`) requires a
+trimmed, exactly 56-character Stellar G-address that passes
+`StrKey.isValidEd25519PublicKey`. The API also requires an authenticated GitHub
+session, a same-origin `Origin` header, and a non-frozen wave window. The
+`User` row provides the GitHub identity; the `Registration` row stores the
+address plus readiness fields, `maintainerOrgId`, timestamps, and `deletedAt`.
 
-## Retention
+Email addresses, usernames, and invite codes are **not** collected by this
+payload, so there is nothing of that kind to retain or purge here. Rejected
+payloads are not persisted. Address changes are additionally recorded in the
+address-history tables, and operators must not log raw payloads outside the
+standard structured/redacted error reporting.
 
-- Registration payloads are retained only as long as needed to provision the
-  account and satisfy audit requirements.
-- Rejected (invalid) payloads are not persisted; validation errors are returned
-  to the caller and not stored.
-- Operators should not log raw payload contents (email, wallet address, invite
-  code) outside of the standard structured error reporting.
+## Soft delete → deleted list → restore
+
+1. **Soft delete** — `DELETE /api/registrations/:id` (maintainer only,
+   same-origin) sets `deletedAt` to the current time. The row and its audit
+   trail stay in PostgreSQL; readiness queries and the paginated contributor
+   list exclude rows with a non-null `deletedAt`. The deletion is recorded as
+   audit action `registration.delete` with the address as `targetLabel`.
+2. **Deleted list** — `GET /api/registrations/deleted` returns soft-deleted rows
+   newest-first with cursor pagination (`limit` default 25, max 100). The lookup
+   is scoped to `session.user.maintainerOrgId` when present, so a maintainer
+   cannot page through another org's tombstones. Each item exposes `id`,
+   `stellarAddress`, `userId`, `githubUsername`, `deletedAt`, `createdAt`, and
+   `updatedAt`.
+3. **Restore** — `POST /api/registrations/:id/restore` (maintainer only,
+   same-origin) finds a row where `id` matches, `deletedAt` is not null, and
+   `maintainerOrgId` matches the session's org when one is configured. It then
+   clears `deletedAt` in a single `update` and writes audit action
+   `registration.restore` with `actorId`, `actorLogin`, `targetId` (registration
+   id), `targetLabel` (stellar address), and a `restoredAt` metadata timestamp.
+4. **Cache invalidation** — after a successful delete or restore,
+   `invalidateContributorListCaches()` busts the shared contributor list caches
+   so the dashboard immediately reflects the new membership. Failed mutations
+   do not invalidate.
+
+`RestorePanel.tsx` is the maintainer UI for steps 2 and 3. It lists the most
+recent deleted registrations (default page size 25, capped at 100) and asks for
+confirmation before calling the restore endpoint.
+
+## Authorization and response semantics
+
+| Situation | Status | Notes |
+|---|---|---|
+| Missing/invalid maintainer session | `403` `{ "error": "Forbidden" }` | No `findFirst`, `update`, audit entry, or cache invalidation |
+| Cross-origin request | `403` | `assertSameOrigin` runs before session lookup and any DB work |
+| Registration id missing, already active, or in another org | `404` `{ "error": "Deleted registration not found" }` | Identical response for all three cases prevents tombstone enumeration |
+| Another active registration already uses the address | `409` `{ "error": "This Stellar address is already actively registered" }` | Prisma unique-constraint (`P2002`) from the `stellarAddress` index; no audit entry |
+| Success | `200` `{ "success": true, "registration": ... }` | Audited and cache-invalidated |
+
+The deleted list follows the same `403` rule for non-maintainers. Org scoping
+uses the same `maintainerOrgId` value in both routes; sessions created before
+that field existed fall back to `"default"`, which keeps single-tenant
+deployments working.
 
 ## Operator notes
 
-- Validation rules live in the shared schemas under `src/lib/`; update them in
-  one place to keep the API and client consistent.
-- If a new registration field is added, extend the shared schema and update the
-  table above so retention expectations remain documented.
+- `AuditAction` in `src/types/index.ts` includes `registration.delete` and
+  `registration.restore`; query `/api/audit` for either action to reconstruct a
+  tombstone's lifecycle.
+- The OpenAPI document (`src/lib/openapi-spec.ts`) describes the restore `409`
+  as the address-conflict case, not as "registration is not deleted" (which is
+  a `404`).
+- Restore is a write: it is blocked by maintenance mode and by an active wave
+  freeze window if those guards are enabled for the deployment.

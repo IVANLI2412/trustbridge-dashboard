@@ -2,6 +2,12 @@ import "server-only";
 
 import { createHmac, timingSafeEqual } from "node:crypto";
 
+import { canonicalizeGithubUsername } from "@/lib/github-username";
+
+function signingUsername(username: string): string {
+  return canonicalizeGithubUsername(username) ?? username;
+}
+
 /**
  * Resolves secret key for HMAC badge signing.
  * Prefers BADGE_SIGNING_KEY, falls back to NEXTAUTH_SECRET, TOKEN_ENCRYPTION_KEY,
@@ -25,13 +31,13 @@ export function getBadgeSigningKey(): string {
 /**
  * Computes an HMAC-SHA256 signature for a badge request.
  *
- * @param username - GitHub username (case-sensitive as stored)
+ * @param username - GitHub username (canonicalized before signing)
  * @param expiresAt - Optional UNIX timestamp in seconds when signature expires
  * @returns 64-character hex HMAC string
  */
 export function signBadge(username: string, expiresAt?: number): string {
   const secret = getBadgeSigningKey();
-  const payload = `${username}:${expiresAt ?? 0}`;
+  const payload = `${signingUsername(username)}:${expiresAt ?? 0}`;
   return createHmac("sha256", secret).update(payload).digest("hex");
 }
 
@@ -99,13 +105,14 @@ export function generateBadgeUrl(
     expiresAt = Math.floor(Date.now() / 1000) + expiresInSeconds;
   }
 
-  const sig = signBadge(username, expiresAt);
+  const canonicalUsername = signingUsername(username);
+  const sig = signBadge(canonicalUsername, expiresAt);
   const searchParams = new URLSearchParams({ sig });
 
   if (expiresAt !== undefined) {
     searchParams.set("exp", expiresAt.toString());
   }
 
-  const path = `/api/badge/${encodeURIComponent(username)}?${searchParams.toString()}`;
+  const path = `/api/badge/${encodeURIComponent(canonicalUsername)}?${searchParams.toString()}`;
   return baseUrl ? `${baseUrl.replace(/\/$/, "")}${path}` : path;
 }

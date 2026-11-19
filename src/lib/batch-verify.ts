@@ -34,6 +34,25 @@ export interface BatchVerificationOptions {
    * Minimum XLM reserve requirement
    */
   minXlmReserve?: number;
+  jobId?: string;
+  onProgress?: (event: BatchVerificationProgressEvent) => void | Promise<void>;
+}
+
+export interface BatchVerificationProgressEvent {
+  type: "progress";
+  jobId: string;
+  processed: number;
+  total: number;
+  errors: number;
+  done: boolean;
+  updatedAt: string;
+}
+
+export interface BatchProgressEmitter {
+  readonly snapshot: BatchVerificationProgress;
+  record(result: VerificationCheckResult): void;
+  finish(): void;
+  flush(): Promise<void>;
 }
 
 /**
@@ -68,29 +87,31 @@ export async function batchVerify(
   verifyFn: (address: string) => Promise<VerificationCheckResult>,
   options: BatchVerificationOptions = {},
 ): Promise<VerificationCheckResult[]> {
-  const { concurrency = 5, timeout = 10_000 } = options;
+  const { concurrency = 5, timeout = 10_000, jobId = "batch-verify", onProgress } = options;
 
   const results: VerificationCheckResult[] = [];
   const queue = [...verifications];
+  const emitter = onProgress
+    ? createBatchProgressEmitter(jobId, verifications.length, onProgress)
+    : null;
 
   const worker = async () => {
     while (queue.length > 0) {
       const item = queue.shift();
       if (!item) break;
 
+      let result: VerificationCheckResult;
       try {
         const timeoutPromise = new Promise<VerificationCheckResult>((_, reject) =>
           setTimeout(() => reject(new Error('Verification timeout')), timeout),
         );
 
-        const result = await Promise.race([
+        result = await Promise.race([
           verifyFn(item.stellar_address),
           timeoutPromise,
         ]);
-
-        results.push(result);
       } catch (error) {
-        results.push({
+        result = {
           username: item.username,
           stellar_address: item.stellar_address,
           status: 'error',
@@ -100,14 +121,19 @@ export async function batchVerify(
             trustline: false,
             reserve: false,
           },
-        });
+        };
       }
+
+      results.push(result);
+      emitter?.record(result);
     }
   };
 
-  // Run workers concurrently
   const workers = Array.from({ length: concurrency }, () => worker());
   await Promise.all(workers);
+
+  emitter?.finish();
+  await emitter?.flush();
 
   return results;
 }
@@ -198,6 +224,92 @@ export function parseBatchProgress(raw: unknown): BatchVerificationProgress {
       typeof candidate.updatedAt === 'string'
         ? candidate.updatedAt
         : new Date().toISOString(),
+  };
+}
+
+export function toBatchProgressEvent(
+  progress: BatchVerificationProgress,
+): BatchVerificationProgressEvent {
+  return {
+    type: "progress",
+    jobId: progress.jobId,
+    processed: progress.completed,
+    total: progress.total,
+    errors: progress.results.filter((result) => result.status === 'error').length,
+    done: progress.done,
+    updatedAt: progress.updatedAt,
+  };
+}
+
+export function parseJobProgressEvent(raw: unknown): BatchVerificationProgressEvent | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+
+  const candidate = raw as Partial<BatchVerificationProgressEvent>;
+  const isCount = (value: unknown): value is number =>
+    typeof value === 'number' && Number.isFinite(value) && value >= 0;
+
+  if (
+    candidate.type !== 'progress' ||
+    typeof candidate.jobId !== 'string' ||
+    typeof candidate.updatedAt !== 'string' ||
+    !isCount(candidate.processed) ||
+    !isCount(candidate.total) ||
+    !isCount(candidate.errors) ||
+    typeof candidate.done !== 'boolean'
+  ) {
+    return null;
+  }
+
+  return {
+    type: 'progress',
+    jobId: candidate.jobId,
+    processed: candidate.processed,
+    total: candidate.total,
+    errors: candidate.errors,
+    done: candidate.done,
+    updatedAt: candidate.updatedAt,
+  };
+}
+
+function nextProgressTimestamp(previous: string): string {
+  const previousMs = Date.parse(previous);
+  return new Date(
+    Math.max(Date.now(), Number.isFinite(previousMs) ? previousMs + 1 : 0),
+  ).toISOString();
+}
+
+export function createBatchProgressEmitter(
+  jobId: string,
+  total: number,
+  onSnapshot: (event: BatchVerificationProgressEvent) => void | Promise<void>,
+): BatchProgressEmitter {
+  let snapshot = createBatchProgress(jobId, total);
+  let pending: Promise<void> = Promise.resolve();
+
+  const emit = (next: BatchVerificationProgress) => {
+    const stamped: BatchVerificationProgress = {
+      ...next,
+      updatedAt: nextProgressTimestamp(snapshot.updatedAt),
+    };
+    snapshot = stamped;
+    pending = pending
+      .then(() => onSnapshot(toBatchProgressEvent(stamped)))
+      .catch(() => undefined);
+  };
+
+  return {
+    get snapshot() {
+      return snapshot;
+    },
+    record(result: VerificationCheckResult) {
+      emit(recordBatchProgress(snapshot, result));
+    },
+    finish() {
+      if (!snapshot.done) emit(finalizeBatchProgress(snapshot));
+    },
+    flush() {
+      return pending;
+    },
   };
 }
 

@@ -73,6 +73,14 @@ describe("badge-signing", () => {
       expect(verifyBadgeSignature("alice", sig)).toBe(true);
     });
 
+    it("signs and verifies canonical usernames consistently", () => {
+      const sig = signBadge("alice");
+      expect(signBadge("@Alice")).toBe(sig);
+      expect(signBadge(" ALICE ")).toBe(sig);
+      expect(verifyBadgeSignature("@Alice", sig)).toBe(true);
+      expect(verifyBadgeSignature(" ALICE ", sig)).toBe(true);
+    });
+
     it("fails verification for a tampered signature", () => {
       const sig = signBadge("alice");
       const tampered = sig.substring(0, 63) + (sig.endsWith("0") ? "1" : "0");
@@ -119,6 +127,13 @@ describe("badge-signing", () => {
     it("includes base URL when provided", () => {
       const url = generateBadgeUrl("alice", { baseUrl: "https://example.com" });
       expect(url.startsWith("https://example.com/api/badge/alice?sig=")).toBe(true);
+    });
+
+    it("emits the canonical username in the path with a matching signature", () => {
+      const url = generateBadgeUrl("@Alice");
+      expect(url).toContain("/api/badge/alice?sig=");
+      const params = new URLSearchParams(url.split("?")[1]);
+      expect(verifyBadgeSignature("alice", params.get("sig"))).toBe(true);
     });
 
     it("includes exp parameter when expiresInSeconds is specified", () => {

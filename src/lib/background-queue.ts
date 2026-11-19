@@ -246,6 +246,7 @@ import "server-only";
 
 import { Prisma } from "@prisma/client";
 
+import { parseJobProgressEvent, type BatchVerificationProgressEvent } from "@/lib/batch-verify";
 import { prisma } from "@/lib/prisma";
 import { redactString } from "@/lib/sentry";
 
@@ -373,6 +374,33 @@ export class BackgroundQueue {
       result: (record.result as Record<string, unknown>) ?? undefined,
       ownerId: record.ownerId ?? undefined,
     };
+  }
+
+  async updateJobProgress(
+    jobId: string,
+    progress: BatchVerificationProgressEvent
+  ): Promise<void> {
+    try {
+      const record = await prisma.queueJob.findUnique({
+        where: { id: jobId },
+        select: { status: true, result: true },
+      });
+      if (!record || record.status !== "processing") return;
+
+      const currentResult =
+        record.result && typeof record.result === "object" && !Array.isArray(record.result)
+          ? (record.result as Record<string, unknown>)
+          : {};
+      const previous = parseJobProgressEvent(currentResult.progress);
+      if (previous && previous.updatedAt >= progress.updatedAt) return;
+
+      await prisma.queueJob.updateMany({
+        where: { id: jobId, status: "processing" },
+        data: { result: { ...currentResult, progress } as never },
+      });
+    } catch (error) {
+      console.error(`[Queue] Failed to persist progress for job ${jobId}:`, error);
+    }
   }
 
   /**

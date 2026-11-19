@@ -77,6 +77,32 @@ flowchart TB
 - The GitHub access token is **encrypted at rest** (AES-256-GCM, `TOKEN_ENCRYPTION_KEY`) before being written — see [`src/lib/token-crypto.ts`](../src/lib/token-crypto.ts) — and every encrypt/decrypt attempt is recorded in `TokenAuditLog` via [`src/lib/token-audit.ts`](../src/lib/token-audit.ts)
 - The raw access token is **never** placed on the JWT or session object, so it is never sent to the browser; server code that needs it calls `getDecryptedGithubAccessToken(userId)` in `src/lib/auth.ts`
 
+### GitHub username canonicalization (Action parity)
+
+Public username lookups share one canonicalization rule with the
+`trustbridge-action` repository's CODEOWNERS/allowlist matcher
+(`normalizeOwnerHandle` in `src/codeowners.ts` of that repo):
+
+1. Trim leading/trailing whitespace.
+2. Lowercase the result.
+3. Strip **exactly one** leading `@` (so `@@alice` is invalid).
+4. Require `/^[a-z0-9_-]{1,39}$/`.
+
+`canonicalizeGithubUsername()` in [`src/lib/github-username.ts`](../src/lib/github-username.ts)
+returns `null` for anything else, and both `GET /api/profile/[username]` and
+`GET /api/badge/[username]` use it before querying
+`prisma.user.findFirst({ where: { githubUsername: { equals: canonical, mode: "insensitive" } } })`.
+Invalid, private, missing, and soft-deleted profiles all keep the same `404`
+response so usernames cannot be enumerated. `signBadge()`, `verifyBadgeSignature()`,
+and `generateBadgeUrl()` canonicalize the same way, so a signature created for
+`Alice`, `@Alice`, or ` alice ` is interchangeable.
+
+**No extra Unicode normalization is performed.** There is deliberately no NFKC
+normalization, confusable/homoglyph folding, or locale-specific case mapping
+beyond `String.toLowerCase()` followed by the ASCII-only regex. Non-ASCII
+logins (for example Cyrillic `аlice` or full-width `ＡＬＩＣＥ`) are rejected;
+they are never folded into an ASCII login by this codebase.
+
 ### Route protection (`src/middleware.ts`)
 
 | Route | Requirement |

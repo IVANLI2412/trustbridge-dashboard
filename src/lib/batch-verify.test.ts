@@ -4,7 +4,9 @@ import {
   batchVerify,
   calculateVerificationSummary,
   filterByStatus,
+  parseJobProgressEvent,
   sortByReadiness,
+  type BatchVerificationProgressEvent,
   type VerificationCheckResult,
 } from "@/lib/batch-verify";
 
@@ -60,6 +62,102 @@ describe("sortByReadiness / filterByStatus", () => {
     );
     expect(filtered).toHaveLength(1);
     expect(filtered[0].status).toBe("error");
+  });
+});
+
+describe("batchVerify progress", () => {
+  it("emits ordered snapshots with processed, error counts and completion", async () => {
+    const events: BatchVerificationProgressEvent[] = [];
+    const results = await batchVerify(
+      [
+        { username: "a", stellar_address: "G_a" },
+        { username: "b", stellar_address: "G_b" },
+        { username: "c", stellar_address: "G_c" },
+      ],
+      async (address) => {
+        if (address === "G_b") throw new Error("horizon down");
+        return result("ready", "ok");
+      },
+      {
+        concurrency: 1,
+        jobId: "job-42",
+        onProgress: (event) => {
+          events.push(event);
+        },
+      }
+    );
+
+    expect(results).toHaveLength(3);
+    expect(events.map((event) => event.type)).toEqual([
+      "progress", "progress", "progress",
+    ]);
+    expect(events.map((event) => event.jobId)).toEqual([
+      "job-42", "job-42", "job-42",
+    ]);
+    expect(events.map((event) => event.processed)).toEqual([1, 2, 3]);
+    expect(events.map((event) => event.total)).toEqual([3, 3, 3]);
+    expect(events.map((event) => event.errors)).toEqual([0, 1, 1]);
+    expect(events.map((event) => event.done)).toEqual([false, false, true]);
+    expect(new Set(events.map((event) => event.updatedAt)).size).toBe(3);
+    expect(
+      events.map((event) => Date.parse(event.updatedAt)).every(
+        (timestamp, index, all) => index === 0 || timestamp > all[index - 1]
+      )
+    ).toBe(true);
+  });
+
+  it("emits a done snapshot with zero processed for an empty batch", async () => {
+    const events: BatchVerificationProgressEvent[] = [];
+    await batchVerify([], async () => result("ready"), {
+      jobId: "empty",
+      onProgress: (event) => events.push(event),
+    });
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "progress",
+      jobId: "empty",
+      processed: 0,
+      total: 0,
+      errors: 0,
+      done: true,
+    });
+  });
+
+  it("awaits async progress callbacks before resolving", async () => {
+    const seen: number[] = [];
+    await batchVerify(
+      [{ username: "a", stellar_address: "G_a" }],
+      async () => result("ready"),
+      {
+        jobId: "async",
+        onProgress: async (event) => {
+          await Promise.resolve();
+          seen.push(event.processed);
+        },
+      }
+    );
+    expect(seen).toEqual([1]);
+  });
+});
+
+describe("parseJobProgressEvent", () => {
+  it("accepts a valid snapshot and rejects malformed ones", () => {
+    const valid = {
+      type: "progress",
+      jobId: "job-1",
+      processed: 2,
+      total: 3,
+      errors: 1,
+      done: false,
+      updatedAt: "2026-10-01T00:00:00.000Z",
+    };
+    expect(parseJobProgressEvent(valid)).toEqual(valid);
+    expect(parseJobProgressEvent(null)).toBeNull();
+    expect(parseJobProgressEvent({ ...valid, type: "status" })).toBeNull();
+    expect(parseJobProgressEvent({ ...valid, processed: -1 })).toBeNull();
+    expect(parseJobProgressEvent({ ...valid, done: "yes" })).toBeNull();
+    expect(parseJobProgressEvent({ ...valid, updatedAt: 123 })).toBeNull();
   });
 });
 

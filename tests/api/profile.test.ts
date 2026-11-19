@@ -11,7 +11,7 @@ import { resetRateLimit } from "@/lib/rate-limit";
 vi.mock("@/lib/prisma", () => ({
   prisma: {
     user: {
-      findUnique: vi.fn(),
+      findFirst: vi.fn(),
     },
     registration: {
       findUnique: vi.fn(),
@@ -78,7 +78,7 @@ describe("GET /api/profile/[username]", () => {
   });
 
   it("returns 404 when user does not exist", async () => {
-    vi.mocked(prisma.user.findUnique).mockResolvedValue(null);
+    vi.mocked(prisma.user.findFirst).mockResolvedValue(null);
     const res = await getPublicProfile(getProfile("nobody"), {
       params: { username: "nobody" },
     });
@@ -86,7 +86,7 @@ describe("GET /api/profile/[username]", () => {
   });
 
   it("returns 404 when registration is private (profilePublic=false)", async () => {
-    vi.mocked(prisma.user.findUnique).mockResolvedValue({
+    vi.mocked(prisma.user.findFirst).mockResolvedValue({
       githubUsername: "alice",
       registration: { ...readyRegistration, profilePublic: false },
     } as any);
@@ -97,7 +97,7 @@ describe("GET /api/profile/[username]", () => {
   });
 
   it("returns 404 when registration is soft-deleted", async () => {
-    vi.mocked(prisma.user.findUnique).mockResolvedValue({
+    vi.mocked(prisma.user.findFirst).mockResolvedValue({
       githubUsername: "alice",
       registration: { ...readyRegistration, deletedAt: new Date() },
     } as any);
@@ -108,7 +108,7 @@ describe("GET /api/profile/[username]", () => {
   });
 
   it("returns public profile without stellarAddress when showStellarAddress=false", async () => {
-    vi.mocked(prisma.user.findUnique).mockResolvedValue({
+    vi.mocked(prisma.user.findFirst).mockResolvedValue({
       githubUsername: "alice",
       registration: { ...readyRegistration, showStellarAddress: false },
     } as any);
@@ -123,7 +123,7 @@ describe("GET /api/profile/[username]", () => {
   });
 
   it("includes stellarAddress when showStellarAddress=true", async () => {
-    vi.mocked(prisma.user.findUnique).mockResolvedValue({
+    vi.mocked(prisma.user.findFirst).mockResolvedValue({
       githubUsername: "alice",
       registration: { ...readyRegistration, showStellarAddress: true },
     } as any);
@@ -140,13 +140,41 @@ describe("GET /api/profile/[username]", () => {
       params: { username: "a".repeat(40) },
     });
     expect(res.status).toBe(404);
-    expect(prisma.user.findUnique).not.toHaveBeenCalled();
+    expect(prisma.user.findFirst).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 for non-ASCII/homoglyph usernames without querying", async () => {
+    const res = await getPublicProfile(getProfile("\u0430lice"), {
+      params: { username: "\u0430lice" },
+    });
+    expect(res.status).toBe(404);
+    expect(prisma.user.findFirst).not.toHaveBeenCalled();
+  });
+
+  it("canonicalizes @Alice / spaced / uppercase usernames for the lookup", async () => {
+    vi.mocked(prisma.user.findFirst).mockResolvedValue({
+      githubUsername: "alice",
+      registration: readyRegistration,
+    } as any);
+
+    for (const raw of ["@Alice", " Alice ", "ALICE"]) {
+      const res = await getPublicProfile(getProfile(encodeURIComponent(raw)), {
+        params: { username: raw },
+      });
+      expect(res.status).toBe(200);
+      expect(prisma.user.findFirst).toHaveBeenLastCalledWith({
+        where: {
+          githubUsername: { equals: "alice", mode: "insensitive" },
+        },
+        select: expect.any(Object),
+      });
+    }
   });
 
   it("returns 429 when rate limit is exceeded", async () => {
     // Exhaust the 30 req/min limit
     for (let i = 0; i < 30; i++) {
-      vi.mocked(prisma.user.findUnique).mockResolvedValue(null);
+      vi.mocked(prisma.user.findFirst).mockResolvedValue(null);
       await getPublicProfile(
         new NextRequest(`http://localhost:3000/api/profile/nobody`, {
           method: "GET",
@@ -155,7 +183,7 @@ describe("GET /api/profile/[username]", () => {
         { params: { username: "nobody" } }
       );
     }
-    vi.mocked(prisma.user.findUnique).mockResolvedValue(null);
+    vi.mocked(prisma.user.findFirst).mockResolvedValue(null);
     const res = await getPublicProfile(
       new NextRequest(`http://localhost:3000/api/profile/nobody`, {
         method: "GET",
@@ -167,7 +195,7 @@ describe("GET /api/profile/[username]", () => {
   });
 
   it("sets Cache-Control: public on a valid profile", async () => {
-    vi.mocked(prisma.user.findUnique).mockResolvedValue({
+    vi.mocked(prisma.user.findFirst).mockResolvedValue({
       githubUsername: "alice",
       registration: readyRegistration,
     } as any);

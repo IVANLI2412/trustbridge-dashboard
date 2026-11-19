@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 
 import { verifyBadgeSignature } from "@/lib/badge-signing";
 import { renderBadgeSvg } from "@/lib/badge-svg";
+import { canonicalizeGithubUsername } from "@/lib/github-username";
 import { prisma } from "@/lib/prisma";
 import { computeReadiness } from "@/lib/readiness";
 import { checkRateLimit, extractClientIp, buildRateLimitHeaders } from "@/lib/rate-limit";
@@ -37,10 +38,8 @@ export async function GET(
     );
   }
 
-  const { username } = params;
-
-  // Validate username format to avoid unnecessary database lookups
-  if (!username || !/^[a-zA-Z0-9_-]{1,39}$/.test(username)) {
+  const username = canonicalizeGithubUsername(params.username);
+  if (!username) {
     return NextResponse.json(
       { error: "Not found" },
       { status: 404, headers: rlHeaders }
@@ -61,8 +60,10 @@ export async function GET(
   }
 
   // Fetch user registration from DB
-  const user = await prisma.user.findUnique({
-    where: { githubUsername: username },
+  const user = await prisma.user.findFirst({
+    where: {
+      githubUsername: { equals: username, mode: "insensitive" },
+    },
     select: {
       githubUsername: true,
       registration: {

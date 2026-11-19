@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 export interface JobProgressEvent {
-  type: "status" | "processing" | "completed" | "failed" | "error";
+  type: "status" | "processing" | "progress" | "completed" | "failed" | "error";
   jobId?: string;
   status?: string;
   result?: Record<string, unknown>;
@@ -12,6 +12,11 @@ export interface JobProgressEvent {
   completedAt?: string | null;
   message?: string;
   createdAt?: string | null;
+  processed?: number;
+  total?: number;
+  errors?: number;
+  done?: boolean;
+  updatedAt?: string;
 }
 
 export interface UseJobProgressOptions {

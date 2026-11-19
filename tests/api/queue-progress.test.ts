@@ -391,6 +391,138 @@ describe("GET /api/contributors/queue/progress — event stream", () => {
     });
   });
 
+  it("emits a progress snapshot before the terminal completed event", async () => {
+    vi.useFakeTimers();
+    try {
+      signInAs("user-1");
+      const progress = {
+        type: "progress",
+        jobId: "job-1",
+        processed: 2,
+        total: 4,
+        errors: 1,
+        done: false,
+        updatedAt: "2026-01-01T00:00:01.000Z",
+      };
+      const sequence = [
+        makeJob({ status: "processing", startedAt: FIXED_DATE }),
+        makeJob({
+          status: "processing",
+          startedAt: FIXED_DATE,
+          result: { progress },
+        }),
+        makeJob({
+          status: "completed",
+          completedAt: FIXED_DATE,
+          result: { progress, refreshed: 4 },
+        }),
+      ];
+      let call = 0;
+      vi.mocked(queueLib.backgroundQueue.getJob).mockImplementation(() => {
+        const job = sequence[Math.min(call, sequence.length - 1)];
+        call += 1;
+        return job;
+      });
+
+      const { GET } = await import("@/app/api/contributors/queue/progress/route");
+      const response = await GET(
+        createRequest("/api/contributors/queue/progress?jobId=job-1")
+      );
+      const reading = collectEvents(response);
+      await vi.advanceTimersByTimeAsync(2500);
+      const { events } = await reading;
+
+      expect(events.map((event) => event.type)).toEqual([
+        "status",
+        "progress",
+        "processing",
+        "completed",
+      ]);
+      expect(events[1]).toEqual(progress);
+      expect(events[3]).toMatchObject({ type: "completed", result: { progress, refreshed: 4 } });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("dedupes progress snapshots by updatedAt but emits newer ones", async () => {
+    vi.useFakeTimers();
+    try {
+      signInAs("user-1");
+      const first = {
+        type: "progress",
+        jobId: "job-1",
+        processed: 1,
+        total: 2,
+        errors: 0,
+        done: false,
+        updatedAt: "2026-01-01T00:00:01.000Z",
+      };
+      const second = { ...first, processed: 2, errors: 1, done: true, updatedAt: "2026-01-01T00:00:02.000Z" };
+      const stale = { ...second, updatedAt: "2026-01-01T00:00:00.000Z" };
+      const sequence = [
+        makeJob({ status: "processing", startedAt: FIXED_DATE, result: { progress: first } }),
+        makeJob({ status: "processing", startedAt: FIXED_DATE, result: { progress: first } }),
+        makeJob({ status: "processing", startedAt: FIXED_DATE, result: { progress: stale } }),
+        makeJob({ status: "processing", startedAt: FIXED_DATE, result: { progress: second } }),
+        makeJob({
+          status: "completed",
+          completedAt: FIXED_DATE,
+          result: { refreshed: 2 },
+        }),
+      ];
+      let call = 0;
+      vi.mocked(queueLib.backgroundQueue.getJob).mockImplementation(() => {
+        const job = sequence[Math.min(call, sequence.length - 1)];
+        call += 1;
+        return job;
+      });
+
+      const { GET } = await import("@/app/api/contributors/queue/progress/route");
+      const response = await GET(
+        createRequest("/api/contributors/queue/progress?jobId=job-1")
+      );
+      const reading = collectEvents(response);
+      await vi.advanceTimersByTimeAsync(4500);
+      const { events } = await reading;
+
+      expect(events.filter((event) => event.type === "progress")).toEqual([
+        first,
+        second,
+      ]);
+      expect(events.map((event) => event.type)).toEqual([
+        "status",
+        "progress",
+        "processing",
+        "processing",
+        "progress",
+        "processing",
+        "completed",
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ignores malformed progress payloads for backward compatibility", async () => {
+    signInAs("user-1");
+    vi.mocked(queueLib.backgroundQueue.getJob).mockReturnValue(
+      makeJob({
+        status: "completed",
+        completedAt: FIXED_DATE,
+        result: { refreshed: 1, progress: "legacy-unstructured-value" },
+      })
+    );
+
+    const { GET } = await import("@/app/api/contributors/queue/progress/route");
+    const response = await GET(
+      createRequest("/api/contributors/queue/progress?jobId=job-1")
+    );
+    const { events } = await collectEvents(response);
+
+    expect(events.map((event) => event.type)).toEqual(["status", "completed"]);
+  });
+
   it("allows streaming jobs without an ownerId (legacy/public jobs)", async () => {
     signInAs("user-1");
     vi.mocked(queueLib.backgroundQueue.getJob).mockReturnValue(

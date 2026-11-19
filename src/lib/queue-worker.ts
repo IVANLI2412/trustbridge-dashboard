@@ -1,6 +1,7 @@
 import "server-only";
 
 import { backgroundQueue, type Job } from "@/lib/background-queue";
+import { createBatchProgressEmitter } from "@/lib/batch-verify";
 import { createNotification } from "@/lib/notifications";
 import {
   getContributors,
@@ -13,8 +14,22 @@ backgroundQueue.registerHandler("recheck.batch", async (job: Job) => {
   const startTime = Date.now();
 
   try {
-    const refreshed = await refreshAllContributors();
     const { contributors } = await getContributors();
+    const emitter = createBatchProgressEmitter(job.id, contributors.length, (event) =>
+      backgroundQueue.updateJobProgress(job.id, event)
+    );
+
+    const refreshed = await refreshAllContributors((item) => {
+      emitter.record({
+        username: item.registrationId,
+        stellar_address: "",
+        status: item.error ? "error" : "ready",
+        error_message: item.error,
+        checks: { funded: false, trustline: false, reserve: false },
+      });
+    });
+    emitter.finish();
+    await emitter.flush();
 
     job.result = {
       refreshed: refreshed.refreshed,

@@ -325,6 +325,21 @@ const safeId = raw && isValidRequestId(raw) ? raw : null;
 
 ---
 
+## Load-testing the paginated read path
+
+`GET /api/contributors/paginated?limit=25` is exercised by two k6 scenarios:
+
+- `contributors_paginated` in `scripts/k6/treasury-export-load.js` (Wave payout window)
+- `contributors_paginated` in `scripts/k6/registration-open-day-load.js` (registration spike)
+
+Both require a maintainer `next-auth.session-token` cookie and validate the
+`contributors` / `hasMore` / `total` response fields with a p95 threshold of
+1500 ms. See [docs/PERFORMANCE_TESTING.md](./PERFORMANCE_TESTING.md) for the
+exact commands, env vars, and success criteria. Registration load also requires
+a contributor session, same-origin `Origin`/`Referer`, a non-public Horizon
+fixture, and a roster outside the freeze window; its rate limits are
+process-local.
+
 ## Pagination
 
 Pagination for list endpoints (e.g. `GET /api/contributors`) is not yet implemented — the current contributor list is returned in full. When contributor counts grow large enough to require pagination, the standard approach for this codebase will be:
