@@ -70,6 +70,46 @@ export function parseDatabasePoolConfig(urlStr: string): DatabasePoolConfig {
 }
 
 /**
+ * Common placeholder strings accepted by `new URL()` but useless at runtime.
+ * Failing fast on these avoids half-booted dashboards pointed at a fake host.
+ */
+function isPlaceholderUrl(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  return (
+    !normalized ||
+    /<[^>]*>|\.\.\.|change[-_ ]?me|placeholder|replace[-_ ]?me|your[-_ ]?(url|horizon|rpc)|example\.(com|org|net)|^(todo|tbd|none|null|undefined|x+)$/.test(
+      normalized
+    )
+  );
+}
+
+/**
+ * Required-or-explicitly-optional HTTP(S) URL field. Rejects non-http schemes
+ * and placeholder values that would otherwise pass Zod's generic `.url()`.
+ */
+function httpUrlField(name: string) {
+  return z
+    .string()
+    .min(1, `${name} is required`)
+    .url(`${name} must be a valid URL`)
+    .refine(
+      (value) => {
+        if (isPlaceholderUrl(value)) return false;
+        try {
+          const parsed = new URL(value);
+          return (
+            (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+            Boolean(parsed.hostname)
+          );
+        } catch {
+          return false;
+        }
+      },
+      `${name} must be an http(s) URL with a real host (placeholders are not allowed)`
+    );
+}
+
+/**
  * Environment variable schema for the TrustBridge Dashboard.
  * Validates all required and optional configuration at application boot.
  */
@@ -102,11 +142,10 @@ const envSchema = z.object({
   // Optional: direct database URL for migrations bypassing PgBouncer
   DIRECT_URL: z.string().url("DIRECT_URL must be a valid URL").optional(),
 
-  // Horizon/Stellar configuration
-  NEXT_PUBLIC_HORIZON_URL: z
-    .string()
-    .url("NEXT_PUBLIC_HORIZON_URL must be a valid URL")
-    .default("https://horizon.stellar.org"),
+  // Horizon/Stellar configuration — explicit, network-correct URLs only.
+  // The previous silent mainnet default is gone: an unset or placeholder
+  // Horizon URL must fail at boot with an actionable error.
+  NEXT_PUBLIC_HORIZON_URL: httpUrlField("NEXT_PUBLIC_HORIZON_URL"),
   NEXT_PUBLIC_DEFAULT_ASSET_CODE: z.string().default("USDC"),
   NEXT_PUBLIC_DEFAULT_ASSET_ISSUER: z.string().default(
     "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
@@ -123,12 +162,10 @@ const envSchema = z.object({
     .optional()
     .default("0.5"),
 
-  // Soroban configuration (optional)
+  // Soroban configuration. The RPC URL is optional only when there is no
+  // contract ID; the cross-field check below enforces that pairing.
   SOROBAN_CONTRACT_ID: z.string().optional(),
-  SOROBAN_RPC_URL: z
-    .string()
-    .url("SOROBAN_RPC_URL must be a valid URL")
-    .optional(),
+  SOROBAN_RPC_URL: httpUrlField("SOROBAN_RPC_URL").optional(),
 
   // Webhook secret (optional at boot, but required for org membership sync — requests are rejected if missing)
   GITHUB_WEBHOOK_SECRET: z.string().optional(),
@@ -188,6 +225,15 @@ const envSchema = z.object({
     .pipe(z.number().int().positive())
     .optional()
     .default("60000"),
+}).superRefine((env, ctx) => {
+  if (env.SOROBAN_CONTRACT_ID && !env.SOROBAN_RPC_URL) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["SOROBAN_RPC_URL"],
+      message:
+        "SOROBAN_RPC_URL is required when SOROBAN_CONTRACT_ID is set; point it at the same Stellar network as NEXT_PUBLIC_HORIZON_URL",
+    });
+  }
 });
 
 export type Environment = z.infer<typeof envSchema>;

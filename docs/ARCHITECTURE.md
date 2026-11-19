@@ -541,3 +541,12 @@ CORS configuration is tested in `tests/unit/cors.test.ts`:
 - [Environment variables](./ENVIRONMENT.md)
 - [Deployment](./DEPLOYMENT.md)
 - [Contributing](./CONTRIBUTING.md)
+
+## Badge rendering parity (#682)
+
+`src/lib/badge-svg.ts` shares one theme table between the dashboard readiness
+statuses and the trustbridge-action state aliases `pass` / `fail` / `skipped`,
+using the Action's shields.io colors (brightgreen/red/lightgrey). XML escaping,
+accessibility labels, badge signing and the signed `/api/badge/[username]` route
+are unchanged. Input-to-text/color fixtures are in
+[BADGE_PARITY.md](./BADGE_PARITY.md).

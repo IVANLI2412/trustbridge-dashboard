@@ -1065,3 +1065,42 @@ Webhook credentials must not be embedded in URLs.
 Webhook URLs must never be logged.
 
 Notification messages must not contain unnecessary PII.
+
+## Boot-time network validation (#683)
+
+`validateEnv()` / `getValidatedEnv()` now fail fast with an `Environment
+validation failed:` error listing the offending variable(s). Network variables
+are validated as **http(s)** URLs with a real host; non-http schemes,
+placeholders (`CHANGEME`, `your-url`, `example.com`, `<...>`, `...`, etc.) and
+malformed values are rejected with a message naming the variable.
+
+### Required network variables
+
+| Variable | When required | Notes |
+|----------|---------------|-------|
+| `NEXT_PUBLIC_HORIZON_URL` | Always | No silent mainnet default at validation time. Set it explicitly even for local dev. |
+| `SOROBAN_CONTRACT_ID` | Only for Soroban-backed deployments | Unset means Postgres-only registration; no RPC required. |
+| `SOROBAN_RPC_URL` | Whenever `SOROBAN_CONTRACT_ID` is set | Must be http(s) and on the same network as Horizon. Optional when no contract ID is configured. |
+
+All other schema defaults (asset code/issuer, thresholds, rate limits, circuit
+breaker, etc.) are unchanged. Lower-level runtime resolvers still keep their
+historical fallback constants for code paths that do not call
+`getValidatedEnv()`, but a correctly configured deployment sets the network
+URLs explicitly.
+
+### Testnet / pubnet combinations
+
+| Deployment | `NEXT_PUBLIC_HORIZON_URL` | `SOROBAN_CONTRACT_ID` | `SOROBAN_RPC_URL` |
+|------------|--------------------------|-----------------------|-------------------|
+| Pubnet, Horizon only | `https://horizon.stellar.org` | unset | unset |
+| Pubnet + Soroban | `https://horizon.stellar.org` | set | `https://mainnet.sorobanrpc.com` |
+| Testnet, Horizon only | `https://horizon-testnet.stellar.org` | unset | unset |
+| Testnet + Soroban | `https://horizon-testnet.stellar.org` | set | `https://soroban-testnet.stellar.org` |
+
+For testnet deployments also override `NEXT_PUBLIC_DEFAULT_ASSET_CODE` and
+`NEXT_PUBLIC_DEFAULT_ASSET_ISSUER` together with the test asset; the shipped
+defaults are Circle USDC on pubnet and must match whatever the Action workflow
+uses (see [Alignment with trustbridge-action](#alignment-with-trustbridge-action)).
+A mismatch between the Horizon network and the RPC network is still surfaced by
+the network panel and audit log as described above — boot validation checks
+URL *shape and presence*, not network equivalence.

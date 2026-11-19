@@ -15,12 +15,22 @@ export function escapeXml(str: string): string {
     .replace(/'/g, "&apos;");
 }
 
+/**
+ * Action badge state aliases. These mirror the states emitted by
+ * trustbridge-action (`pass`, `fail`, `skipped`) so a Wave board sees the
+ * same meaning and color whether it embeds the Action badge or this SVG.
+ */
+export type ActionBadgeStatus = "pass" | "fail" | "skipped";
+
+type BadgeStatus = ReadinessStatus | "unknown" | ActionBadgeStatus;
+
 interface StatusBadgeTheme {
   text: string;
   color: string;
 }
 
-const STATUS_THEMES: Record<ReadinessStatus | "unknown", StatusBadgeTheme> = {
+const STATUS_THEMES: Record<BadgeStatus, StatusBadgeTheme> = {
+  // Existing readiness states — kept unchanged.
   ready: {
     text: "ready",
     color: "#2ea44f",
@@ -37,21 +47,38 @@ const STATUS_THEMES: Record<ReadinessStatus | "unknown", StatusBadgeTheme> = {
     text: "unknown",
     color: "#6e7681",
   },
+
+  // trustbridge-action parity. Colors are the hex equivalents of the
+  // shields.io color names used by the Action: brightgreen, red, lightgrey.
+  pass: {
+    text: "Ready",
+    color: "#4c1",
+  },
+  fail: {
+    text: "Not Ready",
+    color: "#e05d44",
+  },
+  skipped: {
+    text: "Skipped",
+    color: "#9f9f9f",
+  },
 };
 
 /**
  * Generates an SVG readiness badge formatted cleanly for GitHub READMEs.
  *
  * @param status - Readiness status ('ready' | 'low_reserve' | 'not_ready' | 'unknown')
+ *   or an Action alias ('pass' | 'fail' | 'skipped'). Unknown values fall back
+ *   to the grey 'unknown' theme.
  * @param options - Customization options
  * @returns Clean, self-contained SVG string (contains NO PII or Stellar addresses)
  */
 export function renderBadgeSvg(
-  status: ReadinessStatus | "unknown" | string,
+  status: BadgeStatus | string,
   options: RenderBadgeOptions = {}
 ): string {
   const labelText = escapeXml(options.label ?? "trustbridge");
-  const theme = STATUS_THEMES[status as ReadinessStatus] ?? STATUS_THEMES.unknown;
+  const theme = STATUS_THEMES[status as BadgeStatus] ?? STATUS_THEMES.unknown;
   const statusText = escapeXml(theme.text);
 
   // Approximate character width calculations for pixel-perfect SVG layout

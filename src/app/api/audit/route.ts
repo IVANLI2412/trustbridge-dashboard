@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 
 import { requireOperator } from "@/lib/api-auth";
 import { getRecentAuditLog } from "@/lib/audit";
-import { summarizeAuditLog } from "@/lib/audit-format";
+import { hashAuditBundle, summarizeAuditLog } from "@/lib/audit-format";
 import { captureException } from "@/lib/sentry";
 
 export const runtime = "nodejs";
@@ -22,6 +22,7 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({
       entries,
       summary: summarizeAuditLog(entries),
+      hash: hashAuditBundle(entries),
     });
   } catch (error) {
     captureException(error);

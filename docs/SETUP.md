@@ -153,3 +153,12 @@ Run `npx prisma generate` then `npm run build`.
 - [Deploy to Vercel](./DEPLOYMENT.md)
 - [Understand the architecture](./ARCHITECTURE.md)
 - [Contribute](./CONTRIBUTING.md)
+
+## Network variables now fail fast (#683)
+
+Copy `.env.example` and set `NEXT_PUBLIC_HORIZON_URL` explicitly (mainnet
+`https://horizon.stellar.org` or testnet
+`https://horizon-testnet.stellar.org`). There is no silent boot-time default
+anymore. If you set `SOROBAN_CONTRACT_ID`, also set `SOROBAN_RPC_URL` to an
+http(s) endpoint on the same network, or boot will stop with a named error.
+See [ENVIRONMENT.md — Boot-time network validation](./ENVIRONMENT.md#boot-time-network-validation-683).

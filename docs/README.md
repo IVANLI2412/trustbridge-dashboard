@@ -19,6 +19,7 @@
 | [LOGGING_AND_PAGINATION.md](./LOGGING_AND_PAGINATION.md) | Logging and cursor pagination |
 | [PERFORMANCE_TESTING.md](./PERFORMANCE_TESTING.md) | k6 smoke tests and load testing guide |
 | [PWA.md](./PWA.md) | PWA manifest, service worker shell caching, offline banner, security notes |
+| [NOTIFICATION_PREFERENCES.md](./NOTIFICATION_PREFERENCES.md) | Digest/dispute mail preference defaults and API |
 
 ## i18n pattern (#515)
 
