@@ -11,10 +11,18 @@ import { NextRequest } from "next/server";
 import { GET } from "@/app/api/address-history/route";
 
 vi.mock("next-auth", () => ({ getServerSession: vi.fn() }));
-vi.mock("@/lib/address-history", () => ({ getAddressHistory: vi.fn() }));
+vi.mock("@/lib/address-history", async (importOriginal) => {
+  const actual = await importOriginal<
+    typeof import("@/lib/address-history")
+  >();
+  return { ...actual, getAddressHistoryPage: vi.fn() };
+});
+vi.mock("@/lib/audit", () => ({ recordAuditLog: vi.fn() }));
 
 import { getServerSession } from "next-auth";
-import { getAddressHistory } from "@/lib/address-history";
+import { getAddressHistoryPage } from "@/lib/address-history";
+import { recordAuditLog } from "@/lib/audit";
+import { encodeCursor } from "@/lib/cursor-pagination";
 import { generateCsrfToken } from "@/lib/csrf";
 
 let currentUserId = "user-1";
@@ -29,10 +37,16 @@ function getRequest(query = "", customHeaders?: Record<string, string>) {
   });
 }
 
-function mockSession(opts: { id?: string; isMaintainer?: boolean } = {}) {
+function mockSession(
+  opts: { id?: string; isMaintainer?: boolean; githubUsername?: string } = {}
+) {
   currentUserId = opts.id ?? "user-1";
   vi.mocked(getServerSession).mockResolvedValue({
-    user: { id: currentUserId, isMaintainer: opts.isMaintainer ?? false },
+    user: {
+      id: currentUserId,
+      isMaintainer: opts.isMaintainer ?? false,
+      githubUsername: opts.githubUsername,
+    },
   } as never);
 }
 
@@ -49,6 +63,14 @@ const SAMPLE_HISTORY = [
   },
 ];
 
+function page(
+  history = SAMPLE_HISTORY,
+  hasMore = false,
+  nextCursor: string | null = null
+) {
+  return { history, hasMore, nextCursor };
+}
+
 afterEach(() => {
   currentUserId = "user-1";
   vi.clearAllMocks();
@@ -59,7 +81,7 @@ describe("GET /api/address-history — authentication", () => {
     vi.mocked(getServerSession).mockResolvedValue(null);
     const res = await GET(getRequest());
     expect(res.status).toBe(401);
-    expect(getAddressHistory).not.toHaveBeenCalled();
+    expect(getAddressHistoryPage).not.toHaveBeenCalled();
   });
 });
 
@@ -70,7 +92,7 @@ describe("GET /api/address-history — CSRF protection", () => {
     expect(res.status).toBe(403);
     const json = await res.json();
     expect(json).toEqual({ error: "Invalid CSRF token" });
-    expect(getAddressHistory).not.toHaveBeenCalled();
+    expect(getAddressHistoryPage).not.toHaveBeenCalled();
   });
 
   it("returns 403 when CSRF token is invalid", async () => {
@@ -79,7 +101,7 @@ describe("GET /api/address-history — CSRF protection", () => {
     expect(res.status).toBe(403);
     const json = await res.json();
     expect(json).toEqual({ error: "Invalid CSRF token" });
-    expect(getAddressHistory).not.toHaveBeenCalled();
+    expect(getAddressHistoryPage).not.toHaveBeenCalled();
   });
 
   it("returns 403 when CSRF token was issued for another user", async () => {
@@ -89,7 +111,7 @@ describe("GET /api/address-history — CSRF protection", () => {
     expect(res.status).toBe(403);
     const json = await res.json();
     expect(json).toEqual({ error: "Invalid CSRF token" });
-    expect(getAddressHistory).not.toHaveBeenCalled();
+    expect(getAddressHistoryPage).not.toHaveBeenCalled();
   });
 
   it("returns 403 when CSRF token is expired", async () => {
@@ -111,43 +133,49 @@ describe("GET /api/address-history — CSRF protection", () => {
     expect(res.status).toBe(403);
     const json = await res.json();
     expect(json).toEqual({ error: "Invalid CSRF token" });
-    expect(getAddressHistory).not.toHaveBeenCalled();
+    expect(getAddressHistoryPage).not.toHaveBeenCalled();
   });
 
   it("accepts valid CSRF token in csrfToken query parameter", async () => {
     mockSession({ id: "user-1", isMaintainer: false });
-    vi.mocked(getAddressHistory).mockResolvedValue(SAMPLE_HISTORY as never);
+    vi.mocked(getAddressHistoryPage).mockResolvedValue(page() as never);
     const token = generateCsrfToken("user-1");
     const res = await GET(
       getRequest(`?csrfToken=${encodeURIComponent(token)}`, {})
     );
     expect(res.status).toBe(200);
-    expect(getAddressHistory).toHaveBeenCalledWith("user-1");
+    expect(getAddressHistoryPage).toHaveBeenCalledWith("user-1", {
+  cursor: undefined,
+  limit: undefined,
+});
   });
 
   it("rejects maintainer ?userId= lookup when CSRF token is missing", async () => {
     mockSession({ id: "maintainer-1", isMaintainer: true });
     const res = await GET(getRequest("?userId=other-user", {}));
     expect(res.status).toBe(403);
-    expect(getAddressHistory).not.toHaveBeenCalled();
+    expect(getAddressHistoryPage).not.toHaveBeenCalled();
   });
 });
 
 describe("GET /api/address-history — self access", () => {
   it("a signed-in contributor gets their own history back", async () => {
     mockSession({ id: "user-1", isMaintainer: false });
-    vi.mocked(getAddressHistory).mockResolvedValue(SAMPLE_HISTORY as never);
+    vi.mocked(getAddressHistoryPage).mockResolvedValue(page() as never);
 
     const res = await GET(getRequest());
     expect(res.status).toBe(200);
-    expect(getAddressHistory).toHaveBeenCalledWith("user-1");
+    expect(getAddressHistoryPage).toHaveBeenCalledWith("user-1", {
+  cursor: undefined,
+  limit: undefined,
+});
     const json = await res.json();
     expect(json.history).toHaveLength(2);
   });
 
   it("returns an empty array when the user has no history yet", async () => {
     mockSession({ id: "user-1", isMaintainer: false });
-    vi.mocked(getAddressHistory).mockResolvedValue([]);
+    vi.mocked(getAddressHistoryPage).mockResolvedValue(page([]) as never);
 
     const res = await GET(getRequest());
     expect(res.status).toBe(200);
@@ -159,35 +187,138 @@ describe("GET /api/address-history — self access", () => {
 describe("GET /api/address-history — maintainer lookup", () => {
   it("a maintainer passing ?userId= gets that other user's history", async () => {
     mockSession({ id: "maintainer-1", isMaintainer: true });
-    vi.mocked(getAddressHistory).mockResolvedValue(SAMPLE_HISTORY as never);
+    vi.mocked(getAddressHistoryPage).mockResolvedValue(page() as never);
 
     const res = await GET(getRequest("?userId=other-user"));
     expect(res.status).toBe(200);
-    expect(getAddressHistory).toHaveBeenCalledWith("other-user");
+    expect(getAddressHistoryPage).toHaveBeenCalledWith("other-user", {
+  cursor: undefined,
+  limit: undefined,
+});
   });
 
   it("a maintainer with no ?userId= still gets their own history", async () => {
     mockSession({ id: "maintainer-1", isMaintainer: true });
-    vi.mocked(getAddressHistory).mockResolvedValue([]);
+    vi.mocked(getAddressHistoryPage).mockResolvedValue(page([]) as never);
 
     const res = await GET(getRequest());
     expect(res.status).toBe(200);
-    expect(getAddressHistory).toHaveBeenCalledWith("maintainer-1");
+    expect(getAddressHistoryPage).toHaveBeenCalledWith("maintainer-1", {
+  cursor: undefined,
+  limit: undefined,
+});
+  });
+});
+
+describe("GET /api/address-history — pagination and privacy", () => {
+  it("passes cursor and limit through and returns pagination metadata", async () => {
+    mockSession({ id: "user-1" });
+    const cursor = encodeCursor("hist-2");
+    vi.mocked(getAddressHistoryPage).mockResolvedValue(
+      page(SAMPLE_HISTORY.slice(0, 1), true, cursor) as never
+    );
+
+    const res = await GET(getRequest(`?cursor=${cursor}&limit=25`));
+
+    expect(getAddressHistoryPage).toHaveBeenCalledWith("user-1", {
+      cursor,
+      limit: 25,
+    });
+    const json = await res.json();
+    expect(json.history).toHaveLength(1);
+    expect(json.nextCursor).toBe(cursor);
+    expect(json.hasMore).toBe(true);
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+  });
+
+  it("degrades an invalid cursor to the first page", async () => {
+    mockSession({ id: "user-1" });
+    vi.mocked(getAddressHistoryPage).mockResolvedValue(page() as never);
+
+    await GET(getRequest("?cursor=not-base64!!"));
+
+    expect(getAddressHistoryPage).toHaveBeenCalledWith("user-1", {
+      cursor: "not-base64!!",
+      limit: undefined,
+    });
+  });
+
+  it("ignores an invalid limit instead of passing NaN to the query", async () => {
+    mockSession({ id: "user-1" });
+    vi.mocked(getAddressHistoryPage).mockResolvedValue(page() as never);
+
+    await GET(getRequest("?limit=abc"));
+
+    expect(getAddressHistoryPage).toHaveBeenCalledWith("user-1", {
+      cursor: undefined,
+      limit: undefined,
+    });
+  });
+
+  it("returns raw addresses to the owner and never a previousAddress", async () => {
+    mockSession({ id: "user-1", isMaintainer: true });
+    vi.mocked(getAddressHistoryPage).mockResolvedValue(page() as never);
+
+    const res = await GET(getRequest());
+    const json = await res.json();
+
+    expect(json.history[0].stellarAddress).toBe(SAMPLE_HISTORY[0].stellarAddress);
+    expect(json.history[0].addressRedacted).toBe(false);
+    expect(json.history[0]).not.toHaveProperty("previousAddress");
+    expect(recordAuditLog).not.toHaveBeenCalled();
+  });
+
+  it("pseudonymizes addresses and audits a maintainer lookup without storing addresses", async () => {
+    mockSession({
+      id: "maintainer-1",
+      isMaintainer: true,
+      githubUsername: "octocat",
+    });
+    vi.mocked(getAddressHistoryPage).mockResolvedValue(page() as never);
+
+    const res = await GET(getRequest("?userId=other-user"));
+    const json = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(json.history).toHaveLength(2);
+    for (const entry of json.history) {
+      expect(entry.stellarAddress).toMatch(/^redacted:[0-9a-f]{12}$/);
+      expect(entry.addressRedacted).toBe(true);
+      expect(entry).not.toHaveProperty("previousAddress");
+    }
+    expect(recordAuditLog).toHaveBeenCalledWith({
+      action: "address_history.maintainer_lookup",
+      actorId: "maintainer-1",
+      actorLogin: "octocat",
+      targetId: "other-user",
+      targetLabel: "address-history",
+      metadata: {
+        resultCount: 2,
+        hasMore: false,
+        cursorProvided: false,
+      },
+    });
+    expect(JSON.stringify(vi.mocked(recordAuditLog).mock.calls)).not.toContain(
+      SAMPLE_HISTORY[0].stellarAddress
+    );
   });
 });
 
 describe("GET /api/address-history — IDOR prevention", () => {
   it("a non-maintainer passing ?userId=<other-user-id> only gets their OWN history back", async () => {
     mockSession({ id: "user-1", isMaintainer: false });
-    vi.mocked(getAddressHistory).mockResolvedValue(SAMPLE_HISTORY as never);
+    vi.mocked(getAddressHistoryPage).mockResolvedValue(page() as never);
 
     const res = await GET(getRequest("?userId=attacker-target-user"));
 
     expect(res.status).toBe(200);
     // Never called with the attacker-supplied userId.
-    expect(getAddressHistory).not.toHaveBeenCalledWith("attacker-target-user");
+    expect(getAddressHistoryPage).not.toHaveBeenCalledWith("attacker-target-user");
     // Always called with the session user's own id.
-    expect(getAddressHistory).toHaveBeenCalledWith("user-1");
-    expect(getAddressHistory).toHaveBeenCalledTimes(1);
+    expect(getAddressHistoryPage).toHaveBeenCalledWith("user-1", {
+  cursor: undefined,
+  limit: undefined,
+});
+    expect(getAddressHistoryPage).toHaveBeenCalledTimes(1);
   });
 });

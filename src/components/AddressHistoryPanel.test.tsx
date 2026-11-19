@@ -1,6 +1,6 @@
 import React from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AddressHistoryPanel } from "@/components/AddressHistoryPanel";
@@ -114,6 +114,82 @@ describe("AddressHistoryPanel", () => {
         })
       );
     });
+  });
+
+  it("loads the next page with the returned cursor and hides the button at the end", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          history: [
+            {
+              stellarAddress: "GBSX" + "X".repeat(52),
+              changeType: "updated",
+              recordedAt: "2026-08-01T00:00:00.000Z",
+            },
+          ],
+          nextCursor: "aGlzdC0y",
+          hasMore: true,
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          history: [
+            {
+              stellarAddress: "GAAA" + "A".repeat(52),
+              changeType: "initial",
+              recordedAt: "2026-07-01T00:00:00.000Z",
+            },
+          ],
+          nextCursor: null,
+          hasMore: false,
+        }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderWithClient(<AddressHistoryPanel />);
+
+    await screen.findByTestId("address-history-load-more");
+    expect(await screen.findAllByTestId("address-history-entry")).toHaveLength(1);
+
+    fireEvent.click(screen.getByTestId("address-history-load-more"));
+
+    await waitFor(() =>
+      expect(screen.getAllByTestId("address-history-entry")).toHaveLength(2)
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/address-history?cursor=aGlzdC0y",
+      expect.anything()
+    );
+    expect(
+      screen.queryByTestId("address-history-load-more")
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders a redacted address as-is instead of shortening it twice", async () => {
+    const redacted = "redacted:0123456789ab";
+    mockFetchOnce({
+      history: [
+        {
+          stellarAddress: redacted,
+          changeType: "updated",
+          recordedAt: "2026-08-01T00:00:00.000Z",
+          addressRedacted: true,
+        },
+      ],
+      nextCursor: null,
+      hasMore: false,
+    });
+
+    renderWithClient(<AddressHistoryPanel />);
+
+    const entry = await screen.findByTestId("address-history-entry");
+    expect(entry).toHaveTextContent(redacted);
+    expect(entry).not.toHaveTextContent("redacte…");
+    expect(entry.querySelector("p")).not.toHaveAttribute("title");
   });
 });
 

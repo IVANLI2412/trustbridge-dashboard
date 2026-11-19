@@ -143,7 +143,7 @@ describe("AddressInput check progress states", () => {
     await waitFor(
       () => {
         expect(screen.getByTestId("address-check-status")).toHaveTextContent(
-          /try again in 1s/i
+          /retry in 1s/i
         );
       },
       { timeout: 10000 }
@@ -187,7 +187,7 @@ describe("AddressInput check progress states", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("shows a timeout message when the fetch is aborted", async () => {
+  it("shows a timeout message for an internal timeout, not a caller cancellation", async () => {
     const abortError = Object.assign(new Error("The operation was aborted."), {
       name: "AbortError",
     });
@@ -202,7 +202,64 @@ describe("AddressInput check progress states", () => {
     });
   });
 
-  it("shows a generic error message on a plain network failure", async () => {
+  it("ignores a caller-cancelled check without showing error copy", async () => {
+    global.fetch = vi.fn().mockImplementation(
+      (_url: string, init: { signal: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          init.signal.addEventListener("abort", () => {
+            reject(
+              Object.assign(new Error("The operation was aborted."), {
+                name: "AbortError",
+              })
+            );
+          });
+        })
+    ) as unknown as typeof fetch;
+
+    const { rerender } = render(
+      <AddressInput value={VALID} onChange={() => {}} />
+    );
+    await waitFor(() => expect(global.fetch).toHaveBeenCalledTimes(1));
+
+    rerender(<AddressInput value={VALID.slice(0, -1) + "X"} onChange={() => {}} />);
+
+    await waitFor(() => {
+      const signal = (global.fetch as unknown as ReturnType<typeof vi.fn>).mock
+        .calls[0][1].signal as AbortSignal;
+      expect(signal.aborted).toBe(true);
+    });
+    expect(screen.getByTestId("address-check-status")).not.toHaveTextContent(
+      /timed out|cancelled|network error/i
+    );
+    expect(screen.getByTestId("address-check-status")).toHaveClass("sr-only");
+  });
+
+  it("aborts an in-flight check on unmount", async () => {
+    global.fetch = vi.fn().mockImplementation(
+      (_url: string, init: { signal: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          init.signal.addEventListener("abort", () => {
+            reject(
+              Object.assign(new Error("The operation was aborted."), {
+                name: "AbortError",
+              })
+            );
+          });
+        })
+    ) as unknown as typeof fetch;
+
+    const { unmount } = render(
+      <AddressInput value={VALID} onChange={() => {}} />
+    );
+    await waitFor(() => expect(global.fetch).toHaveBeenCalledTimes(1));
+
+    const signal = (global.fetch as unknown as ReturnType<typeof vi.fn>).mock
+      .calls[0][1].signal as AbortSignal;
+    unmount();
+    expect(signal.aborted).toBe(true);
+  });
+
+  it("shows the stable describeCheckOutcome message on a plain network failure", async () => {
     global.fetch = vi
       .fn()
       .mockRejectedValue(new TypeError("Failed to fetch")) as unknown as typeof fetch;
@@ -211,7 +268,7 @@ describe("AddressInput check progress states", () => {
 
     await waitFor(() => {
       expect(screen.getByTestId("address-check-status")).toHaveTextContent(
-        /unable to reach validation service/i
+        /Network error while checking the address/i
       );
     });
   });

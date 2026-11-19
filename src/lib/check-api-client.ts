@@ -15,17 +15,16 @@ import type { HorizonCheckResult } from "@/types";
  *    change — we only need to recognize the existing convention.
  *  - Anything else non-2xx is a generic error.
  *  - The request itself can hang (Horizon retries/circuit breaker can sit
- *    for a while) — there is no client-side timeout today, so we add one
- *    here via `AbortController`.
+ *    for a while), so this wrapper applies its own 10 s timeout via an
+ *    `AbortController` and also relays a caller-provided AbortSignal.
  *
  * This helper normalizes all of that into a single discriminated union so
  * UI code can `switch` on `outcome.kind` instead of re-deriving these rules.
  *
  * Retries: transient failures (timeout, network error, circuit-open, and
  * 429/5xx responses) are retried a bounded number of times. Every attempt
- * for a single logical check reuses the same `Idempotency-Key` header so the
- * server can dedupe side effects (e.g. recheck notifications) and a retried
- * request never double-applies them.
+ * carries the same `Idempotency-Key` for correlation, but `/api/check` is a
+ * read-only Horizon check and does not dedupe requests on that header.
  */
 
 /** How long to wait for `/api/check` before treating the request as timed out. */
@@ -42,6 +41,7 @@ export type CheckOutcome =
   | { kind: "rate_limited"; retryAfterSeconds: number | null; errors: string[] }
   | { kind: "circuit_open"; errors: string[] }
   | { kind: "timeout" }
+  | { kind: "aborted" }
   | { kind: "network_error" }
   | { kind: "error"; status: number; errors: string[] };
 
@@ -67,9 +67,9 @@ function parseRetryAfter(response: Response): number | null {
 }
 
 /**
- * Generate a stable idempotency key for a single logical check. Uses
- * `crypto.randomUUID` when available and falls back to a random string so the
- * key is always present (the server dedupes on it).
+ * Generate a stable correlation key for a single logical check. Uses
+ * `crypto.randomUUID` when available and falls back to a random string. The
+ * header is informational only — `/api/check` does not dedupe on it.
  */
 function createIdempotencyKey(): string {
   if (
@@ -83,8 +83,23 @@ function createIdempotencyKey(): string {
     .slice(2)}`;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<"slept" | "aborted"> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve("aborted");
+      return;
+    }
+
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve("aborted");
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve("slept");
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 /**
@@ -94,6 +109,8 @@ function sleep(ms: number): Promise<void> {
  */
 function isRetryable(outcome: CheckOutcome): boolean {
   switch (outcome.kind) {
+    case "aborted":
+      return false;
     case "timeout":
     case "network_error":
     case "circuit_open":
@@ -109,15 +126,19 @@ function isRetryable(outcome: CheckOutcome): boolean {
 
 /**
  * Perform a single attempt against `/api/check`. Never throws — all failure
- * modes are represented as outcomes. The `idempotencyKey` is sent on every
- * attempt so retries are deduplicated server-side.
+ * modes are represented as outcomes. A caller abort wins over the internal
+ * timeout so cancellation is never mislabelled as a slow Horizon request.
  */
 async function attemptCheck(
   address: string,
-  options: { assetCode?: string; assetIssuer?: string },
+  options: { assetCode?: string; assetIssuer?: string; signal?: AbortSignal },
   idempotencyKey: string
 ): Promise<CheckOutcome> {
+  if (options.signal?.aborted) return { kind: "aborted" };
+
   const controller = new AbortController();
+  const relayAbort = () => controller.abort();
+  options.signal?.addEventListener("abort", relayAbort, { once: true });
   const timer = setTimeout(() => controller.abort(), CHECK_TIMEOUT_MS);
 
   try {
@@ -134,6 +155,8 @@ async function attemptCheck(
       }),
       signal: controller.signal,
     });
+
+    if (options.signal?.aborted) return { kind: "aborted" };
 
     if (response.status === 429) {
       const body = (await response.json().catch(() => ({}))) as {
@@ -165,6 +188,7 @@ async function attemptCheck(
 
     return { kind: "ok", result };
   } catch (error) {
+    if (options.signal?.aborted) return { kind: "aborted" };
     if (error instanceof DOMException && error.name === "AbortError") {
       return { kind: "timeout" };
     }
@@ -180,26 +204,34 @@ async function attemptCheck(
     return { kind: "network_error" };
   } finally {
     clearTimeout(timer);
+    options.signal?.removeEventListener("abort", relayAbort);
   }
 }
 
 /**
  * POST an address to `/api/check` and normalize the response into a
- * `CheckOutcome`. Never throws — all failure modes (timeout, network error,
- * non-2xx status, transient Horizon failure) are represented as outcomes.
+ * `CheckOutcome`. Never throws — all failure modes (internal timeout, caller
+ * cancellation, network error, non-2xx status, transient Horizon failure) are
+ * represented as outcomes.
  *
- * Transient failures are retried up to `CHECK_MAX_ATTEMPTS` total attempts,
- * reusing a single `Idempotency-Key` across every attempt so retries cannot
- * double-apply side effects. The final attempt's outcome is returned.
+ * Transient failures are retried up to `CHECK_MAX_ATTEMPTS` total attempts
+ * with the same correlation key. Caller cancellation stops retries immediately,
+ * including during backoff.
  */
 export async function checkAddressViaApi(
   address: string,
-  options: { assetCode?: string; assetIssuer?: string } = {}
+  options: {
+    assetCode?: string;
+    assetIssuer?: string;
+    signal?: AbortSignal;
+  } = {}
 ): Promise<CheckOutcome> {
   const idempotencyKey = createIdempotencyKey();
   let outcome: CheckOutcome = { kind: "network_error" };
 
   for (let attempt = 0; attempt < CHECK_MAX_ATTEMPTS; attempt++) {
+    if (options.signal?.aborted) return { kind: "aborted" };
+
     outcome = await attemptCheck(address, options, idempotencyKey);
 
     if (outcome.kind === "ok" || !isRetryable(outcome)) {
@@ -217,7 +249,11 @@ export async function checkAddressViaApi(
       outcome.kind === "rate_limited" && outcome.retryAfterSeconds !== null
         ? outcome.retryAfterSeconds * 1000
         : 0;
-    await sleep(Math.min(Math.max(backoff, retryAfterMs), CHECK_TIMEOUT_MS));
+    const waited = await sleep(
+      Math.min(Math.max(backoff, retryAfterMs), CHECK_TIMEOUT_MS),
+      options.signal
+    );
+    if (waited === "aborted") return { kind: "aborted" };
   }
 
   return outcome;
@@ -240,6 +276,8 @@ export function describeCheckOutcome(outcome: CheckOutcome): string {
       return "Stellar services are temporarily unavailable. Please try again in a moment.";
     case "timeout":
       return "The check timed out. Please try again.";
+    case "aborted":
+      return "Check cancelled.";
     case "network_error":
       return "Network error while checking the address. Please check your connection and retry.";
     case "error":

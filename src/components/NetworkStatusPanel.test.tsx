@@ -1,6 +1,6 @@
 import React from "react";
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { NetworkStatusPanel } from "@/components/NetworkStatusPanel";
 import type { NetworkConfig } from "@/types";
@@ -164,5 +164,55 @@ describe("NetworkStatusPanel", () => {
     expect(alert).toHaveTextContent(/Network paused/i);
     expect(alert).toHaveTextContent(/Horizon and Soroban RPC disagree/i);
     expect(alert).toHaveTextContent(/Additional configuration issue detected/i);
+  });
+});
+
+describe("NetworkStatusPanel — read-only network selection", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("renders static docs guidance and no switch UI or POST on aligned networks", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ status: "ok", network: "mainnet" }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(
+      <NetworkStatusPanel
+        config={buildConfig({
+          sorobanUrl: "https://mainnet.sorobanrpc.com",
+          sorobanNetwork: "mainnet",
+          mismatched: false,
+          warnings: [],
+        })}
+      />
+    );
+
+    expect(
+      screen.queryByRole("button", { name: /switch network|switch to/i })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByTestId("network-switch-confirmation")
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("alertdialog", { name: /confirm network switch/i })
+    ).not.toBeInTheDocument();
+    expect(screen.getByText(/docs\/ENVIRONMENT\.md/i)).toHaveAttribute(
+      "href",
+      "https://github.com/Stellar-TrustBridge/trustbridge-dashboard/blob/main/docs/ENVIRONMENT.md"
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(0);
+    for (const [, init] of fetchMock.mock.calls) {
+      expect((init as RequestInit | undefined)?.method ?? "GET").toBe("GET");
+    }
+    expect(
+      fetchMock.mock.calls.some(([url]) =>
+        String(url).includes("/api/settings/network")
+      )
+    ).toBe(false);
   });
 });

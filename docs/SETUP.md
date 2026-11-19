@@ -2,7 +2,7 @@
 
 Step-by-step instructions to run TrustBridge Dashboard locally.
 
-← Back to [README](../README.md) · See also [Environment variables](./ENVIRONMENT.md)
+← Back to [README](../README.md) · See also [Environment variables](./ENVIRONMENT.md) and [Troubleshooting](./TROUBLESHOOTING.md)
 
 ---
 
@@ -141,6 +141,8 @@ Your GitHub account must be a **public member** of the org set in `GITHUB_MAINTA
 
 - Check `NEXT_PUBLIC_HORIZON_URL` (mainnet vs testnet)
 - Ensure the G-address exists on the same network as Horizon
+- Match the exact message you see to a cause and action in
+  [Troubleshooting](./TROUBLESHOOTING.md#address-check-messages)
 
 ### Build fails on Prisma
 

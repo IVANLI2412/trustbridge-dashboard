@@ -9,7 +9,11 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { computeNextAction, WIZARD_ACTION_COPY } from "@/lib/action-lookup";
-import { checkAddressViaApi } from "@/lib/check-api-client";
+import {
+  checkAddressViaApi,
+  describeCheckOutcome,
+  type CheckOutcome,
+} from "@/lib/check-api-client";
 import { isValidGAddress, normalizeGAddress } from "@/lib/stellar-address";
 import { cn } from "@/lib/utils";
 import type { HorizonCheckResult } from "@/types";
@@ -21,25 +25,16 @@ interface AddressInputProps {
   className?: string;
 }
 
-/**
- * Distinct states the debounced Horizon check can be in. `checking` covers
- * every in-flight attempt (there's no separate "retrying" state client-side
- * — retries happen server-side inside `checkStellarAddress`/the circuit
- * breaker and are invisible to the browser); the other non-idle states are
- * terminal outcomes of the most recent request.
- */
+type TerminalCheckOutcome = Exclude<
+  CheckOutcome,
+  { kind: "ok" } | { kind: "aborted" }
+>;
+
 type CheckState =
   | { status: "idle" }
   | { status: "checking" }
   | { status: "result"; result: HorizonCheckResult }
-  | {
-      status: "rate_limited";
-      retryAfterSeconds: number | null;
-      errors: string[];
-    }
-  | { status: "circuit_open"; errors: string[] }
-  | { status: "timeout" }
-  | { status: "error"; errors: string[] };
+  | { status: "outcome"; outcome: TerminalCheckOutcome };
 
 export function AddressInput({
   value,
@@ -52,19 +47,31 @@ export function AddressInput({
   const [copied, setCopied] = useState(false);
   const [copyFailed, setCopyFailed] = useState(false);
 
-  // Guards against debounce/network races: if the user keeps typing, a
-  // later checkAddress() call can be kicked off before an earlier one's
-  // fetch (or its timeout) resolves. Only the response matching the most
-  // recently *started* request is applied.
+  // Guards against debounce/network races: a newer check aborts the previous
+  // request and only the most recently started one may update visible state.
   const requestIdRef = useRef(0);
+  const activeControllerRef = useRef<AbortController | null>(null);
 
   const normalized = normalizeGAddress(value);
   const addressValid = isValidGAddress(normalized);
 
   useEffect(() => {
+    activeControllerRef.current?.abort();
+    activeControllerRef.current = null;
+    setCheckState((current) =>
+      current.status === "checking" ? { status: "idle" } : current
+    );
     const timer = setTimeout(() => setDebouncedValue(value), 500);
     return () => clearTimeout(timer);
   }, [value]);
+
+  useEffect(
+    () => () => {
+      activeControllerRef.current?.abort();
+      activeControllerRef.current = null;
+    },
+    []
+  );
 
   const checkAddress = useCallback(async (address: string) => {
     const requestId = ++requestIdRef.current;
@@ -74,40 +81,26 @@ export function AddressInput({
       return;
     }
 
+    activeControllerRef.current?.abort();
+    const controller = new AbortController();
+    activeControllerRef.current = controller;
+
     setCheckState({ status: "checking" });
-    const outcome = await checkAddressViaApi(address);
+    const outcome = await checkAddressViaApi(address, {
+      signal: controller.signal,
+    });
 
-    // A newer check has started since this one was kicked off — drop this
-    // (now stale) response rather than clobbering fresher state.
-    if (requestIdRef.current !== requestId) return;
-
-    switch (outcome.kind) {
-      case "ok":
-        setCheckState({ status: "result", result: outcome.result });
-        break;
-      case "rate_limited":
-        setCheckState({
-          status: "rate_limited",
-          retryAfterSeconds: outcome.retryAfterSeconds,
-          errors: outcome.errors,
-        });
-        break;
-      case "circuit_open":
-        setCheckState({ status: "circuit_open", errors: outcome.errors });
-        break;
-      case "timeout":
-        setCheckState({ status: "timeout" });
-        break;
-      case "network_error":
-        setCheckState({
-          status: "error",
-          errors: ["Unable to reach validation service"],
-        });
-        break;
-      case "error":
-        setCheckState({ status: "error", errors: outcome.errors });
-        break;
+    if (activeControllerRef.current === controller) {
+      activeControllerRef.current = null;
     }
+    if (controller.signal.aborted || requestIdRef.current !== requestId) return;
+
+    if (outcome.kind === "aborted") return;
+    if (outcome.kind === "ok") {
+      setCheckState({ status: "result", result: outcome.result });
+      return;
+    }
+    setCheckState({ status: "outcome", outcome });
   }, []);
 
   useEffect(() => {
@@ -116,6 +109,12 @@ export function AddressInput({
 
   const isChecking = checkState.status === "checking";
   const result = checkState.status === "result" ? checkState.result : null;
+  const outcome = checkState.status === "outcome" ? checkState.outcome : null;
+  const statusText = isChecking
+    ? "Checking this address with Horizon…"
+    : outcome
+      ? describeCheckOutcome(outcome)
+      : "";
 
   async function copyAddress() {
     if (!addressValid) return;
@@ -222,34 +221,24 @@ export function AddressInput({
         <p
           className={cn(
             "text-xs",
-            checkState.status === "rate_limited" ||
-              checkState.status === "timeout" ||
-              checkState.status === "error"
+            outcome &&
+              (outcome.kind === "rate_limited" ||
+                outcome.kind === "network_error" ||
+                outcome.kind === "error")
               ? "text-destructive"
-              : checkState.status === "circuit_open"
+              : outcome &&
+                  (outcome.kind === "circuit_open" ||
+                    outcome.kind === "timeout")
                 ? "text-amber-700 dark:text-amber-300"
                 : "text-muted-foreground",
-            checkState.status === "idle" || checkState.status === "result"
-              ? "sr-only"
-              : undefined
+            !statusText ? "sr-only" : undefined
           )}
           role="status"
           aria-live="polite"
           aria-busy={isChecking}
           data-testid="address-check-status"
         >
-          {checkState.status === "checking" &&
-            "Checking this address with Horizon…"}
-          {checkState.status === "rate_limited" &&
-            (checkState.retryAfterSeconds
-              ? `Too many checks in a row. Try again in ${checkState.retryAfterSeconds}s.`
-              : "Too many checks in a row. Please wait a moment and try again.")}
-          {checkState.status === "circuit_open" &&
-            "Horizon is temporarily unavailable. We'll keep this address ready to recheck — please try again shortly."}
-          {checkState.status === "timeout" &&
-            "The check timed out. Horizon may be slow right now — try again in a moment."}
-          {checkState.status === "error" &&
-            (checkState.errors[0] ?? "Unable to check this address right now.")}
+          {statusText}
         </p>
       </div>
 

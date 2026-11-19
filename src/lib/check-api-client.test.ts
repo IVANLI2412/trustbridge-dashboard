@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { checkAddressViaApi } from "@/lib/check-api-client";
+import {
+  checkAddressViaApi,
+  describeCheckOutcome,
+} from "@/lib/check-api-client";
 
 function mockResponse({
   status = 200,
@@ -141,7 +144,7 @@ describe("checkAddressViaApi", () => {
     });
   });
 
-  it("returns a timeout outcome when the fetch is aborted", async () => {
+  it("returns a timeout outcome when the internal timer aborts an in-flight fetch", async () => {
     const abortError = Object.assign(new Error("The operation was aborted."), {
       name: "AbortError",
     });
@@ -151,6 +154,64 @@ describe("checkAddressViaApi", () => {
     expect(outcome).toEqual({ kind: "timeout" });
   });
 
+  it("returns an aborted outcome when the caller cancels an in-flight fetch", async () => {
+    const controller = new AbortController();
+    global.fetch = vi.fn().mockImplementation(
+      (_url: string, init: { signal: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          init.signal.addEventListener("abort", () => {
+            reject(
+              Object.assign(new Error("The operation was aborted."), {
+                name: "AbortError",
+              })
+            );
+          });
+        })
+    ) as unknown as typeof fetch;
+
+    const pending = checkAddressViaApi("GADDRESS", {
+      signal: controller.signal,
+    });
+    controller.abort();
+
+    expect(await pending).toEqual({ kind: "aborted" });
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns an aborted outcome without retrying when cancelled during backoff", async () => {
+    const controller = new AbortController();
+    global.fetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        mockResponse({
+          status: 429,
+          ok: false,
+          body: { errors: ["Rate limit exceeded"] },
+        })
+      )
+      .mockResolvedValue(mockResponse({ status: 200, body: readyBody })) as unknown as typeof fetch;
+
+    const pending = checkAddressViaApi("GADDRESS", {
+      signal: controller.signal,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    controller.abort();
+
+    expect(await pending).toEqual({ kind: "aborted" });
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns an aborted outcome without fetching when the caller is already cancelled", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    global.fetch = vi.fn() as unknown as typeof fetch;
+
+    expect(
+      await checkAddressViaApi("GADDRESS", { signal: controller.signal })
+    ).toEqual({ kind: "aborted" });
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
   it("returns a network_error outcome for other fetch failures", async () => {
     global.fetch = vi
       .fn()
@@ -158,5 +219,36 @@ describe("checkAddressViaApi", () => {
 
     const outcome = await checkAddressViaApi("GADDRESS");
     expect(outcome).toEqual({ kind: "network_error" });
+  });
+});
+
+describe("describeCheckOutcome", () => {
+  it.each([
+    [{ kind: "ok", result: readyBody }, "Check completed."],
+    [
+      { kind: "rate_limited", retryAfterSeconds: 5, errors: [] },
+      "Too many requests. Please retry in 5s.",
+    ],
+    [
+      { kind: "rate_limited", retryAfterSeconds: null, errors: [] },
+      "Too many requests. Please try again shortly.",
+    ],
+    [
+      { kind: "circuit_open", errors: [] },
+      "Stellar services are temporarily unavailable. Please try again in a moment.",
+    ],
+    [{ kind: "timeout" }, "The check timed out. Please try again."],
+    [{ kind: "aborted" }, "Check cancelled."],
+    [
+      { kind: "network_error" },
+      "Network error while checking the address. Please check your connection and retry.",
+    ],
+    [
+      { kind: "error", status: 500, errors: ["Server exploded"] },
+      "Server exploded",
+    ],
+    [{ kind: "error", status: 500, errors: [] }, "Failed to check address."],
+  ])("describes %j", (outcome, message) => {
+    expect(describeCheckOutcome(outcome as never)).toBe(message);
   });
 });

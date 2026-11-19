@@ -53,6 +53,10 @@ vi.mock("@/components/OutreachTemplateGenerator", () => ({
   OutreachTemplateGenerator: () => null,
 }));
 
+vi.mock("@/components/AddressHistoryPanel", () => ({
+  AddressHistoryPanel: () => null,
+}));
+
 import { RegisterClient } from "@/app/register/RegisterClient";
 
 const EXISTING_ADDRESS =

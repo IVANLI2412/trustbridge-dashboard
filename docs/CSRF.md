@@ -73,6 +73,13 @@ These GET endpoints expose personally-identifiable payout timeline data and requ
 
 **Why this route needs a CSRF token:** `GET /api/address-history` reveals a contributor's payout address history. Although GET is a "safe" method by HTTP semantics, the response contains PII that should not be disclosed to cross-site requests. The double-submit token pattern (Header `x-csrf-token` + Cookie `csrf_token`) enforces this. The cookie is set via NextAuth's session mechanism (or a dedicated CSRF middleware), and the client must read the cookie and echo it back as a header on every request.
 
+The CSRF check runs before any target-user, pagination, or projection logic. It
+applies to every page: `AddressHistoryPanel` echoes the token on the initial
+request and on each `?cursor=` request from `useInfiniteQuery`. Maintainers can
+add `?userId=<id>` only after the same token check; maintainer responses are
+field-projected, non-cacheable, and audited without address values. See
+[Architecture — Address history pagination and privacy](./ARCHITECTURE.md#address-history-pagination-and-privacy).
+
 ---
 
 ## Webhook routes (signature-based, not CSRF)

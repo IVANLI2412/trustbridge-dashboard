@@ -52,10 +52,23 @@ DATABASE_URL
 NEXT_PUBLIC_HORIZON_URL=https://horizon.stellar.org
 NEXT_PUBLIC_DEFAULT_ASSET_CODE=USDC
 NEXT_PUBLIC_DEFAULT_ASSET_ISSUER=GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN
-NEXT_PUBLIC_MIN_XLM_BALANCE=1
+NEXT_PUBLIC_MIN_XLM_BALANCE=1.5
+NEXT_PUBLIC_BASE_RESERVE_XLM=0.5
+SOROBAN_RPC_URL=https://mainnet.sorobanrpc.com
+SOROBAN_NETWORK_PASSPHRASE="Public Global Stellar Network ; September 2015"
+SOROBAN_CONTRACT_ID=
 ```
 
-Deploy once, then update `NEXTAUTH_URL` if using a custom domain.
+`SOROBAN_RPC_URL`, `SOROBAN_NETWORK_PASSPHRASE`, and `SOROBAN_CONTRACT_ID` are
+optional individually, but the network panel warns when the Horizon and Soroban
+URLs classify as two different known networks. The dashboard's network
+configuration is read-only; use the
+[network switching checklist](./ENVIRONMENT.md#network-switching-checklist) and
+rebuild after changing any `NEXT_PUBLIC_*` value.
+
+Deploy once, then update `NEXTAUTH_URL` if using a custom domain. For exact
+user-visible error messages and recovery steps, link
+[Troubleshooting](./TROUBLESHOOTING.md) from your operations runbook.
 
 ---
 
@@ -291,9 +304,11 @@ variables as the web process:
 | `NEXT_PUBLIC_HORIZON_URL` | **Required** | Stellar Horizon endpoint (e.g. `https://horizon.stellar.org` or `https://horizon-testnet.stellar.org`) to query balances and trustlines. |
 | `NEXT_PUBLIC_DEFAULT_ASSET_CODE` | Optional (default `USDC`) | Asset code to verify contributor trustlines against. |
 | `NEXT_PUBLIC_DEFAULT_ASSET_ISSUER` | Optional | Asset issuer public key for the custom asset trustline check. |
-| `NEXT_PUBLIC_MIN_XLM_BALANCE` | Optional (default `1`) | Minimum required spendable XLM balance for readiness status. |
-| `SOROBAN_RPC_URL` | Optional | RPC URL if Soroban smart contract verification is enabled. |
-| `SOROBAN_CONTRACT_ID` | Optional | Contract address for Soroban integration. |
+| `NEXT_PUBLIC_MIN_XLM_BALANCE` | Optional (default `1.5`) | Minimum required spendable XLM balance for readiness status; must match the Action's `min_xlm_reserve`. |
+| `NEXT_PUBLIC_BASE_RESERVE_XLM` | Optional (default `0.5`) | Stellar base reserve used to compute the locked portion of an account balance. |
+| `SOROBAN_RPC_URL` | Optional | RPC URL if Soroban smart contract verification is enabled; keep on the same network as `NEXT_PUBLIC_HORIZON_URL`. |
+| `SOROBAN_NETWORK_PASSPHRASE` | Optional (defaults to testnet) | Passphrase used when signing Soroban transactions; must match `SOROBAN_RPC_URL`. |
+| `SOROBAN_CONTRACT_ID` | Optional | Contract address for Soroban integration, deployed on the same network as `SOROBAN_RPC_URL`. |
 | `SENTRY_DSN` | Optional | Error reporting and sanitized stack traces if Sentry is enabled. |
 
 #### Supplying environment variables

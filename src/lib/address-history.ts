@@ -1,5 +1,12 @@
 import "server-only";
 
+import { createHash } from "crypto";
+
+import {
+  buildCursorResult,
+  validatePaginationOptions,
+  type CursorPaginationOptions,
+} from "@/lib/cursor-pagination";
 import { prisma } from "@/lib/prisma";
 
 /**
@@ -72,6 +79,105 @@ export async function getAddressHistory(
     changeType: record.changeType,
     recordedAt: record.recordedAt,
   }));
+}
+
+export interface AddressHistoryEntryRecord {
+  stellarAddress: string;
+  changeType: string;
+  recordedAt: Date;
+}
+
+export interface AddressHistoryPage {
+  history: AddressHistoryEntryRecord[];
+  nextCursor: string | null;
+  hasMore: boolean;
+}
+
+/**
+ * Retrieves one cursor-paginated page of history, newest first with `id` as
+ * the tie-breaker so records sharing a timestamp have a stable order.
+ */
+export async function getAddressHistoryPage(
+  userId: string,
+  options: CursorPaginationOptions = {}
+): Promise<AddressHistoryPage> {
+  const rawLimit = options.limit;
+  const { decodedCursor, limit } = validatePaginationOptions({
+    cursor: options.cursor,
+    limit:
+      typeof rawLimit === "number" && Number.isFinite(rawLimit)
+        ? rawLimit
+        : undefined,
+  });
+
+  const rows = await prisma.addressHistoryRecord.findMany({
+    where: { userId },
+    select: {
+      id: true,
+      newAddress: true,
+      changeType: true,
+      recordedAt: true,
+    },
+    orderBy: [{ recordedAt: "desc" }, { id: "desc" }],
+    take: limit + 1,
+    ...(decodedCursor
+      ? { cursor: { id: decodedCursor }, skip: 1 }
+      : {}),
+  });
+
+  const page = buildCursorResult(rows, (row) => row.id, limit);
+
+  return {
+    history: page.data.map((row) => ({
+      stellarAddress: row.newAddress,
+      changeType: row.changeType,
+      recordedAt: row.recordedAt,
+    })),
+    nextCursor: page.nextCursor,
+    hasMore: page.hasMore,
+  };
+}
+
+export interface AddressHistoryViewer {
+  isSelf: boolean;
+  isMaintainer: boolean;
+}
+
+export interface ProjectedAddressHistoryEntry
+  extends AddressHistoryEntryRecord {
+  addressRedacted: boolean;
+}
+
+function pseudonymizeAddress(address: string): string {
+  return `redacted:${createHash("sha256").update(address).digest("hex").slice(0, 12)}`;
+}
+
+/**
+ * Pure field-level projection for one history entry. Self viewers get the raw
+ * address; maintainers looking at someone else see a stable pseudonym. The
+ * previous address is never exposed to any viewer.
+ */
+export function projectAddressHistoryEntry(
+  record: AddressHistoryEntryRecord,
+  viewer: AddressHistoryViewer
+): ProjectedAddressHistoryEntry {
+  if (viewer.isSelf) {
+    return {
+      stellarAddress: record.stellarAddress,
+      changeType: record.changeType,
+      recordedAt: record.recordedAt,
+      addressRedacted: false,
+    };
+  }
+
+  return {
+    stellarAddress: viewer.isMaintainer
+      ? pseudonymizeAddress(record.stellarAddress)
+      : "[unavailable]",
+    changeType: record.changeType,
+    recordedAt: record.recordedAt,
+    addressRedacted: true,
+  };
 }
 
 /**

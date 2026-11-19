@@ -388,7 +388,48 @@ Horizon and Soroban RPC network selection is env-var driven (`NEXT_PUBLIC_HORIZO
 - **UI:** the `NetworkStatusPanel` component (`src/components/NetworkStatusPanel.tsx`) renders on `/dashboard`, showing the Horizon/Soroban network badges and a warning banner when mismatched.
 - **Audit trail:** a mismatch writes a `network_config_mismatch_detected` entry to the existing `AuditLog` table via `recordAuditLog()`, visible through `GET /api/audit`.
 
-This is intentionally read-only and additive — it surfaces the misconfiguration rather than attempting to auto-correct it, since the "right" network is a deployment decision, not something the dashboard can infer.
+This is intentionally read-only and additive — it surfaces the misconfiguration rather than attempting to auto-correct it, since the "right" network is a deployment decision, not something the dashboard can infer. The network panel contains no network switch control and does not POST to `/api/settings/network`; changing networks follows the [network switching checklist](./ENVIRONMENT.md#network-switching-checklist).
+
+---
+
+## Address history pagination and privacy
+
+`GET /api/address-history` (`src/app/api/address-history/route.ts`) returns a
+contributor's own `AddressHistoryRecord` timeline. Session auth and the
+double-submit CSRF token gate are unchanged. Maintainers may opt in to another
+user's timeline with `?userId=<id>`; non-maintainers who supply that parameter
+are silently scoped back to their own `session.user.id` (IDOR prevention).
+
+### Pagination contract
+
+| Parameter / field | Default | Maximum | Behavior |
+|-------------------|---------|---------|----------|
+| `?limit=` | `50` | `100` | Values above the maximum are clamped by `validatePaginationOptions()`; non-finite values are ignored. |
+| `?cursor=` | none | — | Opaque id cursor from `buildCursorResult()`. An invalid or undecodable cursor degrades to the first page rather than returning 400. |
+| `nextCursor` | `null` on last page | — | Opaque cursor for the next page. |
+| `hasMore` | `false` on last page | — | `true` when `limit + 1` rows were fetched. |
+| `Cache-Control` | `no-store` | — | Every response is explicitly non-cacheable. |
+
+`getAddressHistoryPage()` (`src/lib/address-history.ts`) selects only `id`,
+`newAddress`, `changeType`, and `recordedAt`, orders by `recordedAt desc` with
+`id desc` as the tie-breaker, and takes `limit + 1` rows before building the
+cursor page. The legacy `getAddressHistory()` remains unchanged for self-service
+export helpers. `AddressHistoryPanel` uses `useInfiniteQuery` and renders a
+"Load more" button until `hasMore` is false.
+
+### Field projection matrix
+
+| Viewer | Target | `stellarAddress` | `previousAddress` |
+|--------|--------|------------------|-------------------|
+| Self (`targetUserId === session.user.id`) | Own timeline | Raw G-address | Never returned |
+| Maintainer, `?userId=<other>` | Other contributor | Stable `redacted:<12 hex chars>` pseudonym (SHA-256 prefix) | Never returned |
+| Any other viewer | Other contributor | `[unavailable]` | Never returned |
+
+The projection is pure (`projectAddressHistoryEntry()`), so the field matrix is
+unit-tested independently of the route. Maintainer lookups write an
+`address_history.maintainer_lookup` audit entry via `recordAuditLog()` with
+non-address metadata only (`resultCount`, `hasMore`, `cursorProvided`); audit
+logs never contain raw or pseudonymized addresses.
 
 ---
 

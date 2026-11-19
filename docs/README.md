@@ -3,6 +3,7 @@
 | Doc | Description |
 |-----|-------------|
 | [SETUP.md](./SETUP.md) | Local development setup |
+| [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) | Exact user-visible messages, causes, and recovery steps |
 | [ENVIRONMENT.md](./ENVIRONMENT.md) | Environment variable reference |
 | [DOCKER_COMPOSE.md](./DOCKER_COMPOSE.md) | PostgreSQL + app Compose stack |
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | System design, data flow, auth |

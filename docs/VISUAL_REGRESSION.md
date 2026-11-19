@@ -70,3 +70,46 @@ Commit the generated snapshot image files under `tests/e2e/visual.spec.ts-snapsh
 2. Add a new `test()` block inside `test.describe("Visual Regression — ContributorTable columns")`.
 3. Run with `--update-snapshots` to generate the golden baseline.
 4. Commit the `.png` snapshot alongside the spec change.
+
+## Automated WCAG contrast gate (status chips)
+
+Playwright screenshots prove that a component renders; they **do not measure
+WCAG contrast**. A pixel snapshot can look "fine" while a label fails AA, so
+contrast is enforced separately by a pure Vitest audit:
+
+```bash
+npx vitest run src/lib/dark-mode-contrast-audit.test.ts
+```
+
+This command is the CI gate for colour-pair changes and must pass before a
+snapshot is regenerated. Thresholds (WCAG 2.1):
+
+| Content | Minimum ratio |
+|---|---|
+| Normal text (< 18 pt, or < 14 pt bold) | 4.5:1 |
+| Large text (>= 18 pt, or >= 14 pt bold) | 3:1 |
+| UI components / meaningful boundaries (non-text) | 3:1 |
+
+Wave status chips use the shared map in `src/lib/wave-status.ts`:
+`pass -> ready/emerald`, `fail -> danger/red`, `skipped -> warning/amber`,
+`frozen -> warning/amber`. Amber is deliberately chosen for skipped **and**
+frozen: a frozen payout round must stay visible, not fade into a neutral grey.
+The audit iterates all four statuses and checks light text on white, dark text
+on `--card`, and the border tokens used by visible status badges against their
+surfaces. The shared badge variants have `border-transparent`, so they claim no
+separate non-text boundary.
+
+### Exceptions register
+
+No exceptions are currently approved. Any waiver must be reviewed and given an
+owner and expiry here before the gate is relaxed:
+
+| Component | Pair | Ratio | Reason | Owner | Expiry |
+|---|---|---|---|---|---|
+| — | — | — | No exceptions | — | — |
+
+When a real exception is needed, add a row with the component, foreground/background
+pair, measured ratio, business reason, named owner, and a fixed expiry date. An
+empty `Owner` or `Expiry` is not a valid exception. Prefer changing the colour
+stop to a compliant one (see the audited pairs in `src/components/ui/badge.tsx`)
+over adding a waiver.

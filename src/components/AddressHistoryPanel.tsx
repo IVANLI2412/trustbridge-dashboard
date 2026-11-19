@@ -1,8 +1,9 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery } from "@tanstack/react-query";
 import { Clock3, History, Loader2 } from "lucide-react";
 
+import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
@@ -16,10 +17,13 @@ interface AddressHistoryEntry {
   stellarAddress: string;
   changeType: string;
   recordedAt: string;
+  addressRedacted?: boolean;
 }
 
 interface AddressHistoryResponse {
   history: AddressHistoryEntry[];
+  nextCursor: string | null;
+  hasMore: boolean;
 }
 
 const CHANGE_TYPE_LABEL: Record<string, string> = {
@@ -33,13 +37,17 @@ export interface AddressHistoryPanelProps {
 }
 
 export async function fetchAddressHistory(
-  csrfToken?: string
+  csrfToken?: string,
+  cursor?: string | null
 ): Promise<AddressHistoryResponse> {
   const headers: Record<string, string> = {};
   if (csrfToken) {
     headers["x-csrf-token"] = csrfToken;
   }
-  const response = await fetch("/api/address-history", { headers });
+  const url = cursor
+    ? `/api/address-history?cursor=${encodeURIComponent(cursor)}`
+    : "/api/address-history";
+  const response = await fetch(url, { headers });
   if (!response.ok) throw new Error("Failed to load address history");
   return (await response.json()) as AddressHistoryResponse;
 }
@@ -48,12 +56,15 @@ export function AddressHistoryPanel({
   className,
   csrfToken,
 }: AddressHistoryPanelProps) {
-  const historyQuery = useQuery({
+  const historyQuery = useInfiniteQuery({
     queryKey: ["address-history", csrfToken],
-    queryFn: () => fetchAddressHistory(csrfToken),
+    queryFn: ({ pageParam }) => fetchAddressHistory(csrfToken, pageParam),
+    initialPageParam: null as string | null,
+    getNextPageParam: (lastPage) =>
+      lastPage.hasMore ? (lastPage.nextCursor ?? undefined) : undefined,
   });
 
-  const entries = historyQuery.data?.history ?? [];
+  const entries = historyQuery.data?.pages.flatMap((page) => page.history) ?? [];
 
   return (
     <Card className={cn("border-stellar-purple/20", className)} data-testid="address-history-panel">
@@ -126,13 +137,30 @@ export function AddressHistoryPanel({
                 </div>
                 <p
                   className="mt-1 font-mono text-xs text-muted-foreground break-all"
-                  title={entry.stellarAddress}
+                  title={entry.addressRedacted ? undefined : entry.stellarAddress}
                 >
-                  {shortenAddress(entry.stellarAddress)}
+                  {entry.addressRedacted
+                    ? entry.stellarAddress
+                    : shortenAddress(entry.stellarAddress)}
                 </p>
               </li>
             ))}
           </ul>
+        )}
+
+        {historyQuery.hasNextPage && (
+          <div className="flex justify-center pt-1">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              data-testid="address-history-load-more"
+              disabled={historyQuery.isFetchingNextPage}
+              onClick={() => void historyQuery.fetchNextPage()}
+            >
+              {historyQuery.isFetchingNextPage ? "Loading…" : "Load more"}
+            </Button>
+          </div>
         )}
       </CardContent>
     </Card>

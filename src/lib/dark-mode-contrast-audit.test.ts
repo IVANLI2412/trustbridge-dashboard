@@ -17,6 +17,13 @@
 
 import { describe, expect, it } from "vitest";
 
+import {
+  WAVE_STATUS_BADGE_CLASSES,
+  WAVE_STATUS_BADGE_VARIANT,
+  type WaveStatus,
+  type WaveStatusBadgeVariant,
+} from "@/lib/wave-status";
+
 // ---------------------------------------------------------------------------
 // WCAG colour-math helpers
 // ---------------------------------------------------------------------------
@@ -548,5 +555,114 @@ describe("WCAG AA: AddressQr figcaption caption contrast (issue #305)", () => {
     // Documents the original failing state — zinc-700 on the dark card is too dark.
     const ratio = r2(contrastRatio(ZINC_700, DARK_CARD));
     expect(ratio).toBeLessThan(NORMAL_TEXT_MIN);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #675 — Wave status chips (pass / fail / skipped / frozen)
+// ---------------------------------------------------------------------------
+
+const WAVE_STATUS_PAIRS: Record<
+  WaveStatusBadgeVariant,
+  {
+    lightText: [number, number, number];
+    darkText: [number, number, number];
+    lightBorder: [number, number, number];
+    darkBorder: [number, number, number];
+    darkTextClass: string;
+  }
+> = {
+  ready: {
+    lightText: EMERALD_700,
+    darkText: EMERALD_300,
+    lightBorder: [161, 94, 30],
+    darkBorder: EMERALD_600,
+    darkTextClass: "dark:text-emerald-300",
+  },
+  danger: {
+    lightText: RED_700,
+    darkText: RED_300,
+    lightBorder: RED_600,
+    darkBorder: RED_600,
+    darkTextClass: "dark:text-red-300",
+  },
+  warning: {
+    lightText: AMBER_700,
+    darkText: AMBER_300,
+    lightBorder: AMBER_700,
+    darkBorder: AMBER_600,
+    darkTextClass: "dark:text-amber-300",
+  },
+};
+
+const WAVE_STATUSES: WaveStatus[] = ["pass", "fail", "skipped", "frozen"];
+
+describe("WCAG AA: Wave status chips (issue #675)", () => {
+  const NORMAL_TEXT_MIN = 4.5;
+  const NON_TEXT_MIN = 3.0;
+
+  it.each(WAVE_STATUSES)(
+    "%s — light-mode text meets AA on white",
+    (status) => {
+      const pair = WAVE_STATUS_PAIRS[WAVE_STATUS_BADGE_VARIANT[status]];
+      expect(r2(contrastRatio(pair.lightText, WHITE))).toBeGreaterThanOrEqual(
+        NORMAL_TEXT_MIN
+      );
+    }
+  );
+
+  it.each(WAVE_STATUSES)(
+    "%s — dark-mode text meets AA on the dark card",
+    (status) => {
+      const pair = WAVE_STATUS_PAIRS[WAVE_STATUS_BADGE_VARIANT[status]];
+      expect(r2(contrastRatio(pair.darkText, DARK_CARD))).toBeGreaterThanOrEqual(
+        NORMAL_TEXT_MIN
+      );
+    }
+  );
+
+  it.each(WAVE_STATUSES)(
+    "%s — chip classes use the audited dark text stop",
+    (status) => {
+      const variant = WAVE_STATUS_BADGE_VARIANT[status];
+      expect(WAVE_STATUS_BADGE_CLASSES[status]).toContain(
+        WAVE_STATUS_PAIRS[variant].darkTextClass
+      );
+    }
+  );
+
+  it.each(WAVE_STATUSES)(
+    "%s — visible border token meets non-text AA where a border is used",
+    (status) => {
+      const pair = WAVE_STATUS_PAIRS[WAVE_STATUS_BADGE_VARIANT[status]];
+      expect(r2(contrastRatio(pair.lightBorder, WHITE))).toBeGreaterThanOrEqual(
+        NON_TEXT_MIN
+      );
+      expect(r2(contrastRatio(pair.darkBorder, DARK_CARD))).toBeGreaterThanOrEqual(
+        NON_TEXT_MIN
+      );
+    }
+  );
+
+  it("the shared badge variants have transparent borders, so no extra boundary is claimed", () => {
+    for (const classes of Object.values(WAVE_STATUS_BADGE_CLASSES)) {
+      expect(classes).toContain("border-transparent");
+    }
+  });
+
+  it("skipped and frozen deliberately share the visibility-first amber warning pair", () => {
+    expect(WAVE_STATUS_BADGE_VARIANT.skipped).toBe("warning");
+    expect(WAVE_STATUS_BADGE_VARIANT.frozen).toBe("warning");
+    expect(WAVE_STATUS_BADGE_CLASSES.skipped).toBe(
+      WAVE_STATUS_BADGE_CLASSES.frozen
+    );
+    expect(r2(contrastRatio(AMBER_300, DARK_CARD))).toBeGreaterThanOrEqual(
+      NORMAL_TEXT_MIN
+    );
+  });
+
+  it("PRE-FIX: a marginal amber-500 chip label on white fails AA (regression guard)", () => {
+    const AMBER_500: [number, number, number] = [38, 92, 51];
+    expect(r2(contrastRatio(AMBER_500, WHITE))).toBeLessThan(NORMAL_TEXT_MIN);
   });
 });

@@ -98,7 +98,67 @@ Horizon API base URL.
 
 Must match the network your contributors use.
 
-> **Network consistency:** `NEXT_PUBLIC_HORIZON_URL` and `SOROBAN_RPC_URL` (below) should point at the **same** Stellar network. The project's own defaults do not — Horizon defaults to mainnet while `SOROBAN_RPC_URL` defaults to testnet — so a maintainer who only sets one of the two can end up validating contributor funding against a different network than the one Soroban events are read from. The dashboard detects this: `GET /api/settings/network` (maintainer-only) and the "Network configuration" panel on `/dashboard` compare the resolved networks and show a warning banner when they mismatch, and a `network_config_mismatch_detected` entry is written to the audit log (visible via `GET /api/audit`) so the misconfiguration has a durable record. See [`src/lib/network-config.ts`](../src/lib/network-config.ts).
+> **Network consistency:** `NEXT_PUBLIC_HORIZON_URL` and `SOROBAN_RPC_URL` (below) should point at the **same** Stellar network. The project's own defaults do not — Horizon defaults to mainnet while `SOROBAN_RPC_URL` defaults to testnet — so a maintainer who only sets one of the two can end up validating contributor funding against a different network than the one Soroban events are read from. The dashboard detects this: `GET /api/settings/network` (maintainer-only, **read-only — there is no POST/PUT/PATCH handler**) and the "Network configuration" panel on `/dashboard` compare the resolved networks and show a warning banner when they mismatch, and a `network_config_mismatch_detected` entry is written to the audit log (visible via `GET /api/audit`) so the misconfiguration has a durable record. See [`src/lib/network-config.ts`](../src/lib/network-config.ts).
+
+### Network switching checklist
+
+The network is a deployment setting, not a dashboard action. The Network
+configuration panel deliberately contains no switch button: switching without
+changing the underlying asset, contract, and reserve configuration silently
+invalidates readiness checks. Use this checklist for every mainnet ↔ testnet
+(or custom network) move:
+
+1. **Horizon** — set `NEXT_PUBLIC_HORIZON_URL` to the new network's Horizon URL
+   (`https://horizon.stellar.org` for mainnet,
+   `https://horizon-testnet.stellar.org` for testnet).
+2. **Soroban RPC** — set `SOROBAN_RPC_URL` to the matching RPC endpoint
+   (`https://mainnet.sorobanrpc.com` or
+   `https://soroban-testnet.stellar.org`). Keep the two URLs on the same
+   network.
+3. **Passphrase** — set `SOROBAN_NETWORK_PASSPHRASE` to the new network's
+   passphrase when signing Soroban transactions. It is server-only and defaults
+   to `Networks.TESTNET` in `src/lib/contract-sync.ts`; leaving a testnet
+   passphrase on a mainnet deployment produces signatures that the new network
+   rejects.
+4. **Contract** — point `SOROBAN_CONTRACT_ID` at a contract deployed **on the
+   new network**. A mainnet contract ID does not exist on testnet (and vice
+   versa).
+5. **Asset** — update `NEXT_PUBLIC_DEFAULT_ASSET_CODE` **and**
+   `NEXT_PUBLIC_DEFAULT_ASSET_ISSUER` together. Circle USDC mainnet issuer
+   `GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN` does not exist
+   on testnet; testnet assets need their own issuer and a trustline created by
+   each contributor.
+6. **Minimum reserve** — confirm `NEXT_PUBLIC_MIN_XLM_BALANCE` (default `1.5`)
+   and `NEXT_PUBLIC_BASE_RESERVE_XLM` match the new network and still agree with
+   `trustbridge-action`'s `min_xlm_reserve`. See
+   [Alignment with trustbridge-action](#alignment-with-trustbridge-action).
+7. **Funding** — on testnet, fund the contributor and fee-payer accounts with
+   friendbot (for example
+   `curl "https://friendbot.stellar.org?addr=<G-ADDRESS>"`). Mainnet accounts
+   must be funded through a real payment; friendbot does not serve mainnet.
+8. **Redeploy / restart** — redeploy the dashboard and the worker, and restart
+   any long-running process so it reads the new environment. `NEXT_PUBLIC_*`
+   values are inlined at build time, so an environment-variable edit alone is
+   not enough.
+9. **Verify badges** — open `/dashboard` and confirm **both** the Horizon and
+   Soroban RPC badges show the intended network. Then call
+   `GET /api/settings/network` as a maintainer to see the resolved
+   classification and warnings.
+10. **Check the audit trail** — query `GET /api/audit` (or `/dashboard/settings
+    → Recent activity`) for `network_config_mismatch_detected` entries. Existing
+    entries are historical; no new entries after the switch means the running
+    deployment now agrees.
+
+### Failure modes for partially switched networks
+
+| What was switched | What was missed | Symptom | Recovery |
+|---|---|---|---|
+| Horizon only | `SOROBAN_RPC_URL` | "Network paused" banner; both readiness and Soroban events are drawn from different chains; new `network_config_mismatch_detected` entries. | Set the RPC URL, redeploy, re-check both badges. |
+| RPC only | `NEXT_PUBLIC_HORIZON_URL` | Same mismatch banner; contributor funding checks use the old chain. | Set the Horizon URL and rebuild (`NEXT_PUBLIC_*` is build-time). |
+| URLs only | `SOROBAN_NETWORK_PASSPHRASE` / `SOROBAN_CONTRACT_ID` | Both badges look correct, but write-through and the event timeline fail with signature or contract-not-found errors. | Set the passphrase, redeploy the contract on that network, update the ID, restart. |
+| URLs + contract only | Asset code / issuer | Readiness says Ready for the wrong asset; the Action rejects payout or a trustline can never be found. | Update code and issuer together, mirror the Action defaults, ask contributors to add the new trustline. |
+| Everything except reserves | `NEXT_PUBLIC_MIN_XLM_BALANCE` / `NEXT_PUBLIC_BASE_RESERVE_XLM` | Spendable-balance verdicts disagree with the Action; contributors unexpectedly show Low Reserve. | Align both values with the network and the Action's floor, then redeploy. |
+| Mainnet → testnet | Friendbot funding | Accounts do not exist; every check reports not funded. | Fund each testnet account with friendbot and retry. |
 
 ### `NEXT_PUBLIC_DEFAULT_ASSET_CODE`
 
@@ -345,6 +405,10 @@ Soroban RPC endpoint used to fetch contract events for the timeline panel. Defau
 | Testnet | `https://soroban-testnet.stellar.org` |
 
 **Keep this on the same network as `NEXT_PUBLIC_HORIZON_URL` above.** The default here is testnet while the default Horizon URL is mainnet — see the network consistency note above and [Architecture — network hardening](./ARCHITECTURE.md#network-hardening) for how the mismatch is surfaced.
+
+### `SOROBAN_NETWORK_PASSPHRASE`
+
+Optional network passphrase used when signing Soroban transactions. Defaults to `Networks.TESTNET` (`"Test SDF Network ; September 2015"`) in `src/lib/contract-sync.ts` and `src/lib/network-config.ts`. Set it to `"Public Global Stellar Network ; September 2015"` whenever `SOROBAN_RPC_URL` points at mainnet; leaving the testnet default produces signatures that the mainnet network rejects even when both URLs classify correctly.
 
 ### `SOROBAN_OUTBOX_INTERVAL_MS`
 

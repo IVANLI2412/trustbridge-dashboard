@@ -18,8 +18,11 @@ import {
   recordInitialAddress,
   recordAddressChange,
   getAddressHistory,
+  getAddressHistoryPage,
+  projectAddressHistoryEntry,
   getLatestAddress,
 } from "@/lib/address-history";
+import { encodeCursor } from "@/lib/cursor-pagination";
 
 describe("Address History", () => {
   beforeEach(() => {
@@ -136,6 +139,127 @@ describe("Address History", () => {
       const history = await getAddressHistory(userId);
 
       expect(history).toEqual([]);
+    });
+  });
+
+  describe("getAddressHistoryPage", () => {
+    const rows = [
+      {
+        id: "hist-3",
+        newAddress: "GAAA",
+        changeType: "updated",
+        recordedAt: new Date("2026-08-03T00:00:00.000Z"),
+      },
+      {
+        id: "hist-2",
+        newAddress: "GBBB",
+        changeType: "updated",
+        recordedAt: new Date("2026-08-02T00:00:00.000Z"),
+      },
+      {
+        id: "hist-1",
+        newAddress: "GCCC",
+        changeType: "initial",
+        recordedAt: new Date("2026-08-01T00:00:00.000Z"),
+      },
+    ];
+
+    it("fetches limit+1 rows, orders by recordedAt then id, and returns a cursor", async () => {
+      vi.mocked(prisma.addressHistoryRecord.findMany).mockResolvedValueOnce(
+        rows.slice(0, 3) as any
+      );
+
+      const page = await getAddressHistoryPage("user-1", { limit: 2 });
+
+      expect(prisma.addressHistoryRecord.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { userId: "user-1" },
+          orderBy: [{ recordedAt: "desc" }, { id: "desc" }],
+          take: 3,
+        })
+      );
+      expect(page.history).toHaveLength(2);
+      expect(page.hasMore).toBe(true);
+      expect(page.nextCursor).toBe(encodeCursor("hist-2"));
+    });
+
+    it("follows a valid id cursor with skip 1 and caps the limit at 100", async () => {
+      vi.mocked(prisma.addressHistoryRecord.findMany).mockResolvedValueOnce([
+        rows[2],
+      ] as any);
+
+      const page = await getAddressHistoryPage("user-1", {
+        cursor: encodeCursor("hist-1"),
+        limit: 500,
+      });
+
+      expect(prisma.addressHistoryRecord.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          cursor: { id: "hist-1" },
+          skip: 1,
+          take: 101,
+        })
+      );
+      expect(page.history).toHaveLength(1);
+      expect(page.hasMore).toBe(false);
+      expect(page.nextCursor).toBeNull();
+    });
+
+    it("degrades an invalid cursor to the first page", async () => {
+      vi.mocked(prisma.addressHistoryRecord.findMany).mockResolvedValueOnce(
+        rows.slice(0, 2) as any
+      );
+
+      await getAddressHistoryPage("user-1", { cursor: "not-base64!!" });
+
+      expect(prisma.addressHistoryRecord.findMany).toHaveBeenCalledWith(
+        expect.not.objectContaining({ cursor: expect.anything() })
+      );
+      expect(prisma.addressHistoryRecord.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ take: 51 })
+      );
+    });
+  });
+
+  describe("projectAddressHistoryEntry", () => {
+    const record = {
+      stellarAddress: "GBSX" + "X".repeat(52),
+      changeType: "updated",
+      recordedAt: new Date("2026-08-01T00:00:00.000Z"),
+    };
+
+    it("shows the raw address to the owner", () => {
+      expect(
+        projectAddressHistoryEntry(record, { isSelf: true, isMaintainer: false })
+      ).toEqual({
+        ...record,
+        addressRedacted: false,
+      });
+    });
+
+    it("never shows a maintainer a raw address or the previous address", () => {
+      const projected = projectAddressHistoryEntry(record, {
+        isSelf: false,
+        isMaintainer: true,
+      });
+
+      expect(projected.stellarAddress).not.toContain(record.stellarAddress);
+      expect(projected.stellarAddress).toMatch(/^redacted:[0-9a-f]{12}$/);
+      expect(projected).not.toHaveProperty("previousAddress");
+      expect(projected.addressRedacted).toBe(true);
+    });
+
+    it("is stable for the same address and hides it from unprivileged viewers", () => {
+      const viewer = { isSelf: false, isMaintainer: true };
+      expect(
+        projectAddressHistoryEntry(record, viewer).stellarAddress
+      ).toBe(projectAddressHistoryEntry(record, viewer).stellarAddress);
+      expect(
+        projectAddressHistoryEntry(record, {
+          isSelf: false,
+          isMaintainer: false,
+        }).stellarAddress
+      ).toBe("[unavailable]");
     });
   });
 

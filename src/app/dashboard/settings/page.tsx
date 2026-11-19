@@ -19,6 +19,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { describeAuditAction } from "@/lib/audit-format";
 import { formatRelativeTime } from "@/lib/utils";
+import { WAVE_STATUS_BADGE_VARIANT } from "@/lib/wave-status";
 import type { AuditLogEntry, NetworkConfig } from "@/types";
 
 // ContractSyncResult is mirrored here to avoid importing from the server-only
@@ -106,11 +107,14 @@ function ContractSyncPanel() {
     };
   }, []);
 
-  const badgeVariant: Record<SyncStatus, "ready" | "secondary" | "destructive"> = {
+  const badgeVariant: Record<
+    SyncStatus,
+    "ready" | "danger" | "warning" | "secondary"
+  > = {
     loading: "secondary",
-    success: "ready",
-    error: "destructive",
-    skipped: "secondary",
+    success: WAVE_STATUS_BADGE_VARIANT.pass,
+    error: WAVE_STATUS_BADGE_VARIANT.fail,
+    skipped: WAVE_STATUS_BADGE_VARIANT.skipped,
     empty: "secondary",
   };
 
