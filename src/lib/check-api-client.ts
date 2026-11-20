@@ -25,6 +25,18 @@ import type { HorizonCheckResult } from "@/types";
  * 429/5xx responses) are retried a bounded number of times. Every attempt
  * carries the same `Idempotency-Key` for correlation, but `/api/check` is a
  * read-only Horizon check and does not dedupe requests on that header.
+
+ * for a single logical check reuses the same `Idempotency-Key` header so the
+ * server can dedupe side effects (e.g. recheck notifications) and a retried
+ * request never double-applies them.
+ *
+ * Circuit-breaker isolation: the dashboard talks to two independent
+ * dependencies — Horizon (contributor checks, via `/api/check`) and Soroban
+ * (contract sync, via `src/lib/contract-sync.ts`). Each dependency owns its
+ * own breaker key (`horizon` vs `soroban`), so a Soroban outage must never
+ * open the Horizon circuit and vice versa. This module only ever observes
+ * the Horizon breaker; it must not treat a Soroban-side failure as a
+ * Horizon circuit-open signal. See `docs/ARCHITECTURE.md` for the topology.
  */
 
 /** How long to wait for `/api/check` before treating the request as timed out. */
@@ -35,6 +47,13 @@ export const CHECK_MAX_ATTEMPTS = 3;
 
 /** Base backoff between retries, in milliseconds (exponential). */
 export const CHECK_RETRY_BASE_MS = 250;
+
+/**
+ * Circuit-breaker key for the Horizon dependency. Kept distinct from the
+ * Soroban key (`SOROBAN_CIRCUIT_KEY` in `src/lib/contract-sync.ts`) so the
+ * two breakers are isolated and one outage cannot open the other's circuit.
+ */
+export const HORIZON_CIRCUIT_KEY = "horizon";
 
 export type CheckOutcome =
   | { kind: "ok"; result: HorizonCheckResult }
@@ -49,6 +68,10 @@ export type CheckOutcome =
  * True when a successful (HTTP 200) `HorizonCheckResult`'s `errors` match the
  * known transient-Horizon-failure conventions emitted by `src/lib/horizon.ts`
  * (circuit breaker open, or a generic wrapped Horizon error).
+ *
+ * Only Horizon-specific markers are recognized here. Soroban failures use a
+ * different prefix (`Soroban error:`) and must not be classified as a
+ * Horizon circuit-open, preserving breaker isolation.
  */
 function isTransientHorizonError(errors: string[] | undefined): boolean {
   if (!errors || errors.length === 0) return false;
@@ -269,17 +292,15 @@ export function describeCheckOutcome(outcome: CheckOutcome): string {
     case "ok":
       return "Check completed.";
     case "rate_limited":
-      return outcome.retryAfterSeconds !== null
-        ? `Too many requests. Please retry in ${outcome.retryAfterSeconds}s.`
-        : "Too many requests. Please try again shortly.";
+      return outcome.errors[0] ?? "Rate limit exceeded. Please try again later.";
     case "circuit_open":
-      return "Stellar services are temporarily unavailable. Please try again in a moment.";
+      return "Horizon is temporarily unavailable. Contributor checks are paused; other dashboard features remain available.";
     case "timeout":
       return "The check timed out. Please try again.";
     case "aborted":
       return "Check cancelled.";
     case "network_error":
-      return "Network error while checking the address. Please check your connection and retry.";
+      return "Network error while checking the address. Please try again.";
     case "error":
       return outcome.errors[0] ?? "Failed to check address.";
     default:
