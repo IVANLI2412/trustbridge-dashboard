@@ -23,6 +23,10 @@ export const dynamic = "force-dynamic";
  * - circuit-breaker & rate-limit env configuration
  *
  * Requires an authenticated operator session.
+ *
+ * The Prometheus scrape endpoint (`/api/metrics/prometheus`) is a separate
+ * route guarded by `METRICS_SCRAPE_TOKEN`; this JSON snapshot stays behind
+ * operator auth and is never exposed to unauthenticated scrapers.
  */
 export async function GET() {
   const session = await requireOperator("metrics.read");

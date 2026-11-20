@@ -25,6 +25,7 @@ Deploy TrustBridge Dashboard to Vercel with PostgreSQL.
 - [ ] GitHub OAuth App created for production domain
 - [ ] All env vars documented in [ENVIRONMENT.md](./ENVIRONMENT.md)
 - [ ] Durable worker process host/supervisor provisioned (PM2, systemd, Docker, or PaaS worker)
+- [ ] `METRICS_SCRAPE_TOKEN` set for production (see [Prometheus metrics](#prometheus-metrics-scrape-auth))
 
 ---
 
@@ -57,6 +58,9 @@ NEXT_PUBLIC_BASE_RESERVE_XLM=0.5
 SOROBAN_RPC_URL=https://mainnet.sorobanrpc.com
 SOROBAN_NETWORK_PASSPHRASE="Public Global Stellar Network ; September 2015"
 SOROBAN_CONTRACT_ID=
+
+NEXT_PUBLIC_MIN_XLM_BALANCE=1
+METRICS_SCRAPE_TOKEN=<random-32+-byte-secret>
 ```
 
 `SOROBAN_RPC_URL`, `SOROBAN_NETWORK_PASSPHRASE`, and `SOROBAN_CONTRACT_ID` are
@@ -108,6 +112,7 @@ Update or create OAuth App:
 | Registration | Enter G-address, save |
 | Dashboard | `/dashboard` (maintainer org member) |
 | API health | `POST /api/check` with `{ "address": "G..." }` |
+| Prometheus scrape | `GET /api/metrics/prometheus` with `Authorization: Bearer $METRICS_SCRAPE_TOKEN` |
 
 ---
 
@@ -117,6 +122,85 @@ Update or create OAuth App:
 2. Update `NEXTAUTH_URL` to custom domain
 3. Update GitHub OAuth callback URL
 4. Redeploy
+
+---
+
+## Prometheus metrics scrape auth
+
+`GET /api/metrics/prometheus` exposes Wave volume, payout readiness, and
+internal labels. It is **not** world-readable in production: the route requires
+a scrape token and returns `401` with a stable reason code when the token is
+missing or wrong, and `503` when no token is configured in production.
+
+### Configure the token
+
+Set **`METRICS_SCRAPE_TOKEN`** to a high-entropy secret (32+ random bytes, e.g.
+`openssl rand -hex 32`). It is compared with constant-time equality, so the
+length and content of a wrong token do not leak through timing.
+
+```bash
+# Vercel
+vercel env add METRICS_SCRAPE_TOKEN production
+
+# Self-hosted / Docker
+METRICS_SCRAPE_TOKEN="$(openssl rand -hex 32)"
+```
+
+### Scrape configuration
+
+Prometheus must send the token as a bearer credential. Do **not** put the token
+in the URL — it would land in access logs and referrers.
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: trustbridge
+    metrics_path: /api/metrics/prometheus
+    scheme: https
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/trustbridge-scrape-token
+    static_configs:
+      - targets: ["your-domain.vercel.app"]
+```
+
+### Network policy / reverse proxy
+
+Defence in depth — restrict the route at the edge as well as with the token:
+
+- **Vercel**: put `/api/metrics/prometheus` behind a WAF/rewrite rule that only
+  allows your scraper's egress IPs, or front the app with a reverse proxy that
+  enforces an IP allowlist.
+- **Self-hosted**: add an `allow`/`deny` block in nginx for the metrics path and
+  keep the token check as the second layer.
+
+### Token rotation
+
+1. Generate a new token (`openssl rand -hex 32`).
+2. Update `METRICS_SCRAPE_TOKEN` in the platform env and redeploy.
+3. Update the scraper's `credentials_file` and reload Prometheus.
+
+Rotate on a schedule and immediately on suspected exposure. Because the check
+is a single env var, rotation is atomic — there is no dual-token window, so
+briefly expect `401`s until the scraper is updated.
+
+### Cardinality limits
+
+The Prometheus payload is bounded to keep scrape cost and storage predictable:
+
+- Labels are drawn from a fixed set (route, status, outcome); no wallet
+  addresses, GitHub usernames, or free-form input are used as label values.
+- Per-series cardinality is capped; excess series are dropped rather than
+  emitted, so a burst of distinct inputs cannot blow up the TSDB.
+- If you need higher cardinality, raise the cap deliberately and watch
+  `prometheus_tsdb_head_series` after the change.
+
+### Failure reason codes
+
+| Status | Reason | Meaning |
+|--------|--------|---------|
+| `401` | `metrics_unauthorized` | Token missing or does not match |
+| `503` | `metrics_token_not_configured` | Production without `METRICS_SCRAPE_TOKEN` |
 
 ---
 
@@ -156,6 +240,7 @@ DATABASE_URL="postgresql://trustbridge:trustbridge-dev-password@localhost:5432/t
 ## Monitoring & limits
 
 - **Grafana Dashboards & Metrics** — import ready-made dashboards in [docs/grafana/](./grafana/README.md) ([Overview JSON](./grafana/trustbridge-overview.json) / [JSON API JSON](./grafana/trustbridge-json-api.json)) for live payout readiness and health monitoring.
+- **Prometheus scrape auth** — `/api/metrics/prometheus` requires `METRICS_SCRAPE_TOKEN`; see [Prometheus metrics scrape auth](#prometheus-metrics-scrape-auth).
 - **Horizon rate limits** — batch re-check queries one account per registration; large Waves may need throttling (future enhancement)
 - **Vercel serverless timeout** — default 10s on Hobby; batch re-check may need pagination for 100+ contributors
 - **Database connections** — use connection pooling (Neon pooler, Supabase pooler, or Prisma Accelerate)
@@ -496,3 +581,5 @@ WHERE status = 'failed'
 ORDER BY "completedAt" DESC
 LIMIT 10;
 ```
+
+

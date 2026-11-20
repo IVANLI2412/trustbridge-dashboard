@@ -231,3 +231,29 @@ export function assertSignedCsrf(
 
   return null;
 }
+
+/**
+ * Name of the double-submit cookie used by {@link assertCsrf}.
+ * Exported so maintainer mutation routes and their tests share a single
+ * source of truth for the cookie name.
+ */
+export const CSRF_COOKIE_NAME = "csrf_token";
+
+/**
+ * Name of the header carrying the double-submit token.
+ * Exported so maintainer mutation routes and their tests share a single
+ * source of truth for the header name.
+ */
+export const CSRF_HEADER_NAME = "x-csrf-token";
+
+/**
+ * Stable error code returned when a mutating request fails the
+ * double-submit CSRF check. Documented in docs/CSRF.md.
+ */
+export const CSRF_INVALID_TOKEN_ERROR = "Invalid CSRF token";
+
+/**
+ * Stable error code returned when a mutating request fails the
+ * same-origin Origin/Referer check. Documented in docs/CSRF.md.
+ */
+export const CSRF_INVALID_ORIGIN_ERROR = "Invalid request origin";

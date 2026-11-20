@@ -68,6 +68,64 @@ export async function recordNetworkSwitchAudit(input: {
 }
 
 /**
+ * Record a dispute status transition performed by a maintainer.
+ *
+ * Wraps {@link recordAuditLogStrict} with the canonical action name and a
+ * stable metadata shape so the dispute trail stays consistent across call
+ * sites. Strict: a transition must not succeed without an audit record, so
+ * closed cases cannot reopen without a trail.
+ */
+export async function recordDisputeTransitionAudit(input: {
+  actorId?: string | null;
+  actorLogin?: string | null;
+  disputeId: string;
+  fromStatus: string;
+  toStatus: string;
+  reason?: string | null;
+}): Promise<void> {
+  await recordAuditLogStrict({
+    action: "dispute.status.transition",
+    actorId: input.actorId ?? null,
+    actorLogin: input.actorLogin ?? null,
+    targetId: input.disputeId,
+    targetLabel: input.disputeId,
+    metadata: {
+      disputeId: input.disputeId,
+      fromStatus: input.fromStatus,
+      toStatus: input.toStatus,
+      reason: input.reason ?? null,
+    },
+  });
+}
+
+/**
+ * Record a registration retention dry-run report generation.
+ *
+ * Wraps {@link recordAuditLog} with the canonical action name and a stable
+ * metadata shape so operators can trace rehearsals before purging contributor
+ * PII. Best-effort like the underlying helper; the report itself never
+ * contains unmasked addresses (see `src/lib/cron-export.ts`).
+ */
+export async function recordRetentionDryRunAudit(input: {
+  actorId?: string | null;
+  actorLogin?: string | null;
+  format: "json" | "csv";
+  candidateCount: number;
+  cutoff: string;
+  reasonCode?: string | null;
+}): Promise<void> {
+  await recordAuditLog({
+    action: "registrations.retention.dry_run",
+    actorId: input.actorId ?? null,
+    actorLogin: input.actorLogin ?? null,
+    targetId: input.cutoff,
+    targetLabel: input.format,
+    metadata: {
+      format: input.format,
+      candidateCount: input.candidateCount,
+      cutoff: input.cutoff,
+      reasonCode: input.reasonCode ?? null,
+
  * Record a DLQ replay attempt (success or failure).
  *
  * Wraps {@link recordAuditLog} with the canonical action name and a stable

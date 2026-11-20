@@ -6,6 +6,7 @@ import { authOptions } from "@/lib/auth";
 import { assertSameOrigin } from "@/lib/csrf";
 import { invalidateContributorListCaches } from "@/lib/cache-tags";
 import { prisma } from "@/lib/prisma";
+import { recordAuditEvent } from "@/lib/audit";
 import {
   trackServerDisputeClosed,
   trackServerDisputeOpened,
@@ -27,6 +28,25 @@ const updateSchema = z.object({
 
 const DEFAULT_DISPUTES_LIMIT = 25;
 const MAX_DISPUTES_LIMIT = 100;
+
+/**
+ * Dispute status state machine.
+ *
+ *   OPEN -> VALIDATED | REJECTED
+ *
+ * Any other transition (including reopening a VALIDATED/REJECTED case) is
+ * rejected with the stable reason code `INVALID_STATUS_TRANSITION` so closed
+ * Wave cases cannot reopen without an audit trail.
+ */
+const ALLOWED_TRANSITIONS: Record<string, ReadonlyArray<string>> = {
+  OPEN: ["VALIDATED", "REJECTED"],
+  VALIDATED: [],
+  REJECTED: [],
+};
+
+export function isAllowedDisputeTransition(from: string, to: string): boolean {
+  return (ALLOWED_TRANSITIONS[from] ?? []).includes(to);
+}
 
 export async function GET(request: NextRequest) {
   const session = await getServerSession(authOptions);
@@ -151,8 +171,13 @@ export async function PATCH(request: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  // Maintainer ACL: only maintainers may triage/resolve/reject disputes.
+  // Contributors may only open disputes (POST).
   if (!session.user.isMaintainer) {
-    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+    return NextResponse.json(
+      { error: "Forbidden", reason: "MAINTAINER_REQUIRED" },
+      { status: 403 },
+    );
   }
 
   const parsed = updateSchema.safeParse(await request.json().catch(() => null));
@@ -167,6 +192,19 @@ export async function PATCH(request: NextRequest) {
 
   if (!dispute) {
     return NextResponse.json({ error: "Dispute not found" }, { status: 404 });
+  }
+
+  // Enforce the state machine before mutating so closed cases cannot reopen.
+  if (!isAllowedDisputeTransition(dispute.status, parsed.data.status)) {
+    return NextResponse.json(
+      {
+        error: "Invalid status transition",
+        reason: "INVALID_STATUS_TRANSITION",
+        from: dispute.status,
+        to: parsed.data.status,
+      },
+      { status: 409 },
+    );
   }
 
   const updated = await prisma.disputeProof.update({
@@ -184,6 +222,19 @@ export async function PATCH(request: NextRequest) {
       createdAt: true,
       updatedAt: true,
       resolvedAt: true,
+    },
+  });
+
+  // Record the transition so closed cases cannot reopen without an audit trail.
+  await recordAuditEvent({
+    actorId: session.user.id,
+    action: "dispute.status_changed",
+    targetType: "dispute",
+    targetId: updated.id,
+    metadata: {
+      from: dispute.status,
+      to: parsed.data.status,
+      registrationId: updated.registrationId,
     },
   });
 

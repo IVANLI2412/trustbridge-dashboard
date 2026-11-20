@@ -1,35 +1,42 @@
-# Digest Emails
+# Maintainer Email Digest
 
-← Back to [README](../README.md) · See also [Environment variables](./ENVIRONMENT.md) · [Architecture](./ARCHITECTURE.md)
+The maintainer cron digest is composed in `src/lib/cron-digest.ts` and delivered
+through `src/lib/email.ts`. It runs on the maintainer cron schedule and
+summarizes outstanding work for maintainers.
 
----
+## Sections
 
-## What it does
+- **Pending payouts** — payouts awaiting maintainer action.
+- **Open disputes** — disputes that are still open.
+- **Dispute SLA breaches** — disputes older than the configured SLA threshold.
 
-`POST /api/cron/digest` emails the configured maintainer address a readiness
-summary of all contributors — how many are ready for payout, how many have a
-low XLM reserve, and how many are fully blocked — plus a direct link to the
-dashboard.
+## Dispute SLA breaches
 
-**Privacy default:** the email contains only aggregate counts and a dashboard
-link. No contributor usernames, Stellar addresses, or emails appear unless
-`DIGEST_INCLUDE_FULL_LIST=true` is explicitly set.
+Disputes whose age exceeds the configured SLA are surfaced in the digest so that
+stale disputes blocking Wave payouts are not missed.
 
----
+Each digest includes:
 
-## Quick setup
+- A **count** of disputes that have breached the SLA.
+- **Deep links** to each breached dispute in the dashboard so maintainers can
+  act directly from the email.
 
-1. Set `DIGEST_EMAIL` (or reuse `TREASURY_EXPORT_EMAIL`).
-2. Set `CRON_SECRET` if you haven't already (shared with `/api/cron/export`).
-3. Add a Vercel Cron entry (see below).
-4. Deploy.
+### PII policy
 
-That's it. The digest runs on schedule, sends counts + link, and writes an
-audit log entry every time.
+The digest does not leak PII beyond the existing masking policy. Breached
+disputes are identified by their dispute reference and a deep link only; no
+additional participant details are included in the email body.
 
----
+## Configuration
 
-## Environment variables
+The SLA threshold is read from the existing dispute configuration. No new
+environment variables are introduced by this feature.
+
+## Related surfaces
+
+- `src/lib/cron-digest.ts` — digest composition.
+- `src/lib/email.ts` — email rendering and delivery.
+- `src/app/api/disputes/` — disputes API used to resolve deep links.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
