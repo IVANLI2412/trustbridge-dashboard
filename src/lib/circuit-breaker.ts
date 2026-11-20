@@ -185,6 +185,19 @@ export function getCircuitBreakerFor(
   return upstream === "soroban" ? sorobanCircuitBreaker : horizonCircuitBreaker;
 }
 
+/**
+ * Stable breaker keys for each outbound upstream. Exposed so tests and metrics
+ * can assert that Horizon and Soroban never share a circuit.
+ */
+export const CIRCUIT_BREAKER_KEYS: Record<OutboundUpstream, string> = {
+  horizon: "horizon",
+  soroban: "soroban",
+};
+
+export function getCircuitBreakerKey(upstream: OutboundUpstream): string {
+  return CIRCUIT_BREAKER_KEYS[upstream];
+}
+
 export interface DegradedResult {
   ok: false;
   degraded: true;

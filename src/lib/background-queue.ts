@@ -63,6 +63,35 @@ export interface InMemoryWorkerHealthMetrics {
   workerStartedAt: string | null;
 }
 
+/**
+ * Outcome of a DLQ replay attempt. Emitted as an audit event so operators can
+ * trace who forced a Wave contributor recheck (issue #657).
+ */
+export type DlqReplayOutcome = "success" | "failure";
+
+/**
+ * Actor performing a DLQ replay. `id` is the authenticated principal; `email`
+ * is optional and only used for human-readable audit trails.
+ */
+export interface DlqReplayActor {
+  id: string;
+  email?: string | null;
+}
+
+/**
+ * Audit sink invoked for every DLQ replay attempt. Implementations should
+ * forward to `src/lib/audit.ts`; the queue stays decoupled from the audit
+ * transport so tests can inject a spy.
+ */
+export type DlqReplayAuditSink = (event: {
+  actor: DlqReplayActor;
+  jobId: string;
+  outcome: DlqReplayOutcome;
+  error: string | null;
+  replayedAt: string;
+}) => void | Promise<void>;
+
+
 // ---------------------------------------------------------------------------
 // BackgroundQueue
 // ---------------------------------------------------------------------------
@@ -88,9 +117,11 @@ export class InMemoryBackgroundQueue<T = unknown> {
   private lastProcessedAt: string | null = null;
   private workerStartedAt: string | null = null;
   private readonly maxAttempts: number;
+  private readonly auditSink: DlqReplayAuditSink | null;
 
-  constructor(maxAttempts = DEFAULT_MAX_ATTEMPTS) {
+  constructor(maxAttempts = DEFAULT_MAX_ATTEMPTS, auditSink: DlqReplayAuditSink | null = null) {
     this.maxAttempts = maxAttempts;
+    this.auditSink = auditSink;
   }
 
   // -------------------------------------------------------------------------
@@ -168,6 +199,66 @@ export class InMemoryBackgroundQueue<T = unknown> {
    * Return a read-only snapshot of all current job metrics. Safe to call
    * concurrently — does not mutate any internal state.
    */
+  /**
+   * Replay a job that currently sits in the DLQ (issue #657).
+   *
+   * The job is reset to `pending` and re-run through the supplied handler.
+   * Every attempt — success or failure — emits an audit event capturing the
+   * actor, job id, and outcome so DLQ replays are never silent. Existing
+   * pause/freeze and dry-run semantics are enforced by the caller; this
+   * method only mutates the job lifecycle.
+   *
+   * Returns the outcome. Throws a stable error when the job id is unknown or
+   * the job is not currently in the DLQ.
+   */
+  async replayFromDlq(
+    jobId: string,
+    actor: DlqReplayActor,
+    handler: (payload: T) => Promise<void>,
+  ): Promise<DlqReplayOutcome> {
+    const job = this.jobs.get(jobId);
+    if (!job) {
+      throw new Error(`unknown_job: ${jobId}`);
+    }
+    if (job.status !== "dlq") {
+      throw new Error(`job_not_in_dlq: ${jobId}`);
+    }
+
+    job.status = "processing";
+    job.startedAt = new Date().toISOString();
+    job.attempts += 1;
+
+    let outcome: DlqReplayOutcome = "success";
+    let error: string | null = null;
+
+    try {
+      await handler(job.payload);
+      job.status = "completed";
+      job.finishedAt = new Date().toISOString();
+      this.lastProcessedAt = job.finishedAt;
+      job.lastError = null;
+    } catch (err) {
+      outcome = "failure";
+      error = err instanceof Error ? err.message : String(err);
+      job.lastError = error;
+      job.finishedAt = new Date().toISOString();
+      // A failed replay returns the job to the DLQ so operators can retry.
+      job.status = "dlq";
+    }
+
+    if (this.auditSink) {
+      await this.auditSink({
+        actor,
+        jobId: job.id,
+        outcome,
+        error,
+        replayedAt: new Date().toISOString(),
+      });
+    }
+
+    return outcome;
+  }
+
   getWorkerHealthMetrics(): InMemoryWorkerHealthMetrics {
     let pendingCount = 0;
     let processingCount = 0;
