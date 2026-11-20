@@ -237,3 +237,58 @@ When operators need to re-index or re-sync Soroban events from a specific ledger
    DELETE FROM "SorobanEventCursor"
    WHERE "maintainerOrgId" = '<maintainer_org>' AND "eventType" = 'contract';
    ```
+
+---
+
+## 6. Dispute Ticket Status Machine & Maintainer ACL
+
+Dispute tickets follow a strict state machine so closed Wave cases cannot be reopened without an audit trail.
+
+### Statuses
+
+| Status     | Meaning                                                        |
+| ---------- | -------------------------------------------------------------- |
+| `open`     | Filed by a contributor; awaiting maintainer triage.            |
+| `triage`   | A maintainer has picked up the dispute for review.             |
+| `resolved` | Terminal. Dispute upheld and settled.                          |
+| `rejected` | Terminal. Dispute dismissed.                                   |
+
+### Allowed Transitions
+
+| From     | To         | Actor       |
+| -------- | ---------- | ----------- |
+| `open`   | `triage`   | Maintainer  |
+| `triage` | `resolved` | Maintainer  |
+| `triage` | `rejected` | Maintainer  |
+
+Any other transition (including `resolved`/`rejected` → anything, and skipping
+`triage`) is rejected with HTTP `409 Conflict` and reason code
+`DISPUTE_INVALID_TRANSITION`. Terminal statuses cannot be reopened; file a new
+dispute instead.
+
+### Access Control
+
+- **Contributors** may only create disputes (`POST /api/disputes` with no
+  `status`/transition, resulting in `open`).
+- **Maintainers** (per existing org-scope rules) may perform `triage`,
+  `resolved`, and `rejected` transitions.
+- Non-maintainers attempting a transition receive HTTP `403 Forbidden` with
+  reason code `DISPUTE_MAINTAINER_REQUIRED`.
+
+### Audit Trail
+
+Every accepted transition is recorded via `src/lib/audit.ts` as
+`dispute.status_changed` with the previous status, next status, actor, and
+dispute id. Rejected transitions are recorded as
+`dispute.transition_rejected` with the attempted transition and reason code so
+operators can trace attempted reopenings.
+
+### Tests
+
+Automated coverage lives alongside the disputes API tests and covers the happy
+path (`open → triage → resolved`) plus failure paths for invalid transitions
+and non-maintainer actors. Run the targeted suite with:
+
+```bash
+npm test -- disputes
+```

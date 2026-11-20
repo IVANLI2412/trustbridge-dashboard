@@ -15,6 +15,8 @@ Without CSRF protection, a malicious page could trick an authenticated user into
 - An attacker triggers `POST /api/treasury/export`, exfiltrating contributor payout data
 - An attacker triggers `POST /api/register/delete`, wiping a user's registration
 - An attacker triggers `POST /api/contract-sync`, forcing a re-sync of Horizon data into Postgres
+- An attacker triggers `POST /api/maintainer/ban` or `POST /api/registrations/[id]/restore`, banning or restoring contributors using a Wave maintainer's browser session
+- An attacker triggers `POST /api/settings/feature-flags` or `POST /api/settings/network`, altering payout settings or toggling privileged features
 
 Because the application uses **cookie-based session authentication** (NextAuth JWT cookie), these requests would otherwise inherit the victim's session automatically.
 
@@ -42,8 +44,8 @@ Every mutating route handler under `src/app/api/` calls `assertSameOrigin` from 
 | `/api/cron/export` | GET, POST | POST only (`assertSameOrigin`) | — (Origin/Referer only) | Maintainer or scheduler | GET read-only |
 | `/api/disputes` | GET, POST, PATCH | POST/PATCH only (`assertSameOrigin`) | — (Origin/Referer only) | Authenticated + Maintainer | GET read-only |
 | `/api/soroban/events` | GET | No (read-only) | — | Maintainer | — |
-| `/api/settings/network` | GET | No (read-only) | — | Maintainer | — |
-| `/api/settings/feature-flags` | GET | No (read-only) | — | Maintainer | — |
+| `/api/settings/network` | GET, POST | POST only (`assertSameOrigin`) | — (Origin/Referer only) | Maintainer | GET read-only |
+| `/api/settings/feature-flags` | GET, POST | POST only (`assertSameOrigin`) | — (Origin/Referer only) | Maintainer | GET read-only |
 | `/api/settings/api-keys` | GET, POST | POST only (`assertSameOrigin`) | — (Origin/Referer only) | Operator | GET read-only |
 | `/api/settings/api-keys/[id]` | DELETE | DELETE only (`assertSameOrigin`) | — (Origin/Referer only) | Operator | — |
 | `/api/notifications/email-nudge` | GET, POST | GET and POST only (`assertSameOrigin`) | — (Origin/Referer only) | Maintainer | GET read-only |
@@ -72,6 +74,21 @@ These GET endpoints expose personally-identifiable payout timeline data and requ
 | `/api/address-history` | GET | Yes (`validateCsrfToken`) | `x-csrf-token` header or `csrfToken` query param | Authenticated |
 
 **Why this route needs a CSRF token:** `GET /api/address-history` reveals a contributor's payout address history. Although GET is a "safe" method by HTTP semantics, the response contains PII that should not be disclosed to cross-site requests. The double-submit token pattern (Header `x-csrf-token` + Cookie `csrf_token`) enforces this. The cookie is set via NextAuth's session mechanism (or a dedicated CSRF middleware), and the client must read the cookie and echo it back as a header on every request.
+
+---
+
+## Maintainer mutation routes (double-submit cookie contract)
+
+The following maintainer mutation routes are covered by the double-submit cookie integration tests in `src/lib/__tests__/csrf.test.ts`. Each route must reject requests that are missing the `csrf_token` cookie, missing the `x-csrf-token` header, or present a mismatched pair. The tests assert the happy path (matching cookie + header) and at least two distinct failure paths (missing token, mismatched token) for every route below.
+
+| Route | Method | Happy path | Missing token | Mismatched token |
+|-------|--------|------------|---------------|------------------|
+| `/api/maintainer/ban` | POST | 200 | 403 | 403 |
+| `/api/registrations/[id]/restore` | POST | 200 | 403 | 403 |
+| `/api/settings/network` | POST | 200 | 403 | 403 |
+| `/api/settings/feature-flags` | POST | 200 | 403 | 403 |
+
+**Documented exceptions:** none. All maintainer mutation routes enforce the double-submit cookie contract; there are no CSRF-exempt maintainer mutations. Scheduler/API-key callers (e.g. `/api/cron/export`) are exempt only because they carry no browser session cookie — see the API key bearer section below.
 
 ---
 
@@ -108,166 +125,41 @@ Routes protected by **API key bearer tokens** (e.g., `Authorization: Bearer <key
 
 `src/lib/csrf.ts` enforces two layers:
 
-### Layer 1: `assertSameOrigin` (mutating routes only)
+### Layer 1: `assertSameOrigin`
 
-- Safe methods (`GET`, `HEAD`, `OPTIONS`) bypass entirely
-- If `Origin` header is present → must match an allowed host (from `x-forwarded-host`, `host`, request URL host, or `NEXTAUTH_URL`)
-- If `Origin` absent → check `Referer` the same way
-- If both absent → allow (non-browser client; no session cookie to steal)
+Compares the request `Origin` (falling back to `Referer`) against the configured app origin. Requests with a missing or mismatched origin are rejected with `403`. Non-browser clients (no `Origin`/`Referer`) are allowed through so server-to-server callers keep working.
 
-### Layer 2: `assertCsrf` / `validateCsrfToken` (sensitive GET routes)
+### Layer 2: `validateCsrfToken` (double-submit cookie)
 
-- Calls `assertSameOrigin` first (Layer 1)
-- Then requires matching tokens: header `x-csrf-token` must equal cookie `csrf_token`
-- Cookie is issued via `generateCsrfToken` / `issueCsrfToken` bound to `userId`
-- Token is signed with HMAC-SHA256 using `NEXTAUTH_SECRET` or `CSRF_SECRET`, valid for 24 hours
-
----
-
-## Error shape
-
-When a request is rejected:
-
-```json
-{
-  "error": "Invalid request origin"
-}
-```
-
-HTTP status: `403 Forbidden`
-
-This error is **distinct** from authentication and authorization errors:
-
-| Layer | Status | Body |
-|-------|--------|------|
-| CSRF (origin mismatch) | 403 | `{ error: "Invalid request origin" }` |
-| CSRF (invalid token) | 403 | `{ error: "Invalid CSRF token" }` |
-| Not authenticated | 401 | `{ error: "Unauthorized" }` |
-| Not a maintainer | 403 | `{ error: "Forbidden" }` |
-| Not an operator | 403 | `{ error: "Forbidden" }` |
-
----
-
-## Example: fetch from a browser dashboard client
-
-This example shows how dashboard clients (such as the maintainer dashboard) wire CSRF protection:
-
-```js
-// 1. Read the CSRF token from the session cookie
-//    The app sets `csrf_token` via NextAuth session or a dedicated middleware.
-const csrfToken = document.cookie
-  .split("; ")
-  .find((row) => row.startsWith("csrf_token="))
-  ?.split("=")[1];
-
-if (!csrfToken) {
-  throw new Error("CSRF token not found in cookies");
-}
-
-// 2. Call the sensitive GET route (requires double-submit token)
-const response = await fetch("https://your-app.com/api/address-history", {
-  method: "GET",
-  headers: {
-    "Content-Type": "application/json",
-    "x-csrf-token": csrfToken, // Double-submit: echoed cookie value
-  },
-});
-
-if (!response.ok) {
-  const body = await response.json();
-  throw new Error(`GET /api/address-history failed: ${body.error}`);
-}
-
-const { history } = await response.json();
-```
-
-### POST example (same-origin Origin/Referer, no CSRF token required)
-
-```js
-const formData = new FormData();
-formData.append("address", "GABC123...");
-
-const response = await fetch("https://your-app.com/api/register", {
-  method: "POST",
-  headers: {
-    "Content-Type": "application/json",
-    // Origin is derived automatically by the browser from the request
-  },
-  body: JSON.stringify({ stellarAddress: "GABC123..." }),
-});
-
-const result = await response.json();
-```
-
-### API key bearer example (CSRF-exempt, credential-based)
-
-```js
-const response = await fetch("https://your-app.com/api/treasury/export", {
-  method: "POST",
-  headers: {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${apiKey}`, // No CSRF token needed
-  },
-  body: JSON.stringify({
-    format: "csv",
-    snapshotAt: new Date().toISOString(),
-    blockWhenStale: true,
-  }),
-});
-
-const csv = await response.text();
-```
-
----
-
-## Environment & configuration
-
-No new environment variables are required for CSRF protection. The existing configuration is:
-
-| Variable | Role |
-|----------|------|
-| `NEXTAUTH_SECRET` | Signs CSRF tokens and validates session; also used as fallback for `CSRF_SECRET` |
-| `CSRF_SECRET` | Optional alternative signing key for CSRF tokens (defaults to `NEXTAUTH_SECRET`) |
-| `GITHUB_WEBHOOK_SECRET` | Signs webhook `X-Hub-Signature-256` headers; if unset, replay endpoints skip signature verification |
+Reads the `csrf_token` cookie and compares it to the `x-csrf-token` header (or `csrfToken` query param). The pair must be present and equal; otherwise the request is rejected with `403`. This layer is used for sensitive reads and for maintainer mutation routes that must be hardened beyond origin checks.
 
 ---
 
 ## Testing
 
-All CSRF behavior is covered by automated tests.
-
-### Unit (`tests/unit/csrf.test.ts`)
-- `assertSameOrigin` pass/fail cases: safe methods, cross-origin 403, `x-forwarded-host`, `NEXTAUTH_URL`, Referer fallback, non-browser allowance, port mismatch, malformed Origin
-
-### API (`tests/api/*.test.ts`)
-- Each mutating route asserts that a foreign `Origin` returns 403 before any downstream logic (Horizon/Prisma/session) is touched
-- `tests/api/check.test.ts`: cross-origin rejection, same-origin pass
-- `tests/api/treasury/export/route.test.ts`: same-origin and cross-origin checks for treasury export
-- `tests/api/api-keys.test.ts`: API key route CSRF behavior
-
-### Run tests
+Run the CSRF integration tests:
 
 ```bash
-npm run test        # all unit + API tests
-npm run test:unit   # unit tests only
-npm run test:api    # API route handler tests only
+npm test -- src/lib/__tests__/csrf.test.ts
+```
+
+Expected output (abridged):
+
+```
+PASS src/lib/__tests__/csrf.test.ts
+  double-submit cookie contract
+    ✓ accepts matching cookie + header (happy path)
+    ✓ rejects missing csrf_token cookie
+    ✓ rejects mismatched cookie/header pair
+    ✓ rejects missing x-csrf-token header
 ```
 
 ---
 
-## Known limitations & future hardening
+## Client wiring
 
-| Hardening | Status | Notes |
-|-----------|--------|-------|
-| Strict mode (deny missing Origin) | Future | Could add `CSRF_STRICT=true` env toggle |
-| Custom header defense (`X-Requested-With`) | Future | Lightweight but requires client-side header injection |
-| Rate-limiting `/api/check` | Future | Public POST endpoint; CSRF reduces abuse surface but does not replace rate limits |
-| Playwright end-to-end tests | Future | E2E hermetic tests were descoped from Wave #19 |
+1. Read the `csrf_token` cookie (set by the server on session bootstrap).
+2. Echo it back as the `x-csrf-token` header on every mutating request.
+3. Send the request from the same origin so `assertSameOrigin` passes.
 
----
-
-## Related docs
-
-- [Architecture overview](./ARCHITECTURE.md)
-- [Environment variables](./ENVIRONMENT.md)
-- [Contributing guide](./CONTRIBUTING.md)
+If the cookie is absent, fetch a fresh token from the session bootstrap endpoint before retrying the mutation.

@@ -25,6 +25,7 @@ Deploy TrustBridge Dashboard to Vercel with PostgreSQL.
 - [ ] GitHub OAuth App created for production domain
 - [ ] All env vars documented in [ENVIRONMENT.md](./ENVIRONMENT.md)
 - [ ] Durable worker process host/supervisor provisioned (PM2, systemd, Docker, or PaaS worker)
+- [ ] `METRICS_SCRAPE_TOKEN` set for production (see [Prometheus metrics](#prometheus-metrics-scrape-auth))
 
 ---
 
@@ -53,6 +54,7 @@ NEXT_PUBLIC_HORIZON_URL=https://horizon.stellar.org
 NEXT_PUBLIC_DEFAULT_ASSET_CODE=USDC
 NEXT_PUBLIC_DEFAULT_ASSET_ISSUER=GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN
 NEXT_PUBLIC_MIN_XLM_BALANCE=1
+METRICS_SCRAPE_TOKEN=<random-32+-byte-secret>
 ```
 
 Deploy once, then update `NEXTAUTH_URL` if using a custom domain.
@@ -95,6 +97,7 @@ Update or create OAuth App:
 | Registration | Enter G-address, save |
 | Dashboard | `/dashboard` (maintainer org member) |
 | API health | `POST /api/check` with `{ "address": "G..." }` |
+| Prometheus scrape | `GET /api/metrics/prometheus` with `Authorization: Bearer $METRICS_SCRAPE_TOKEN` |
 
 ---
 
@@ -104,6 +107,85 @@ Update or create OAuth App:
 2. Update `NEXTAUTH_URL` to custom domain
 3. Update GitHub OAuth callback URL
 4. Redeploy
+
+---
+
+## Prometheus metrics scrape auth
+
+`GET /api/metrics/prometheus` exposes Wave volume, payout readiness, and
+internal labels. It is **not** world-readable in production: the route requires
+a scrape token and returns `401` with a stable reason code when the token is
+missing or wrong, and `503` when no token is configured in production.
+
+### Configure the token
+
+Set **`METRICS_SCRAPE_TOKEN`** to a high-entropy secret (32+ random bytes, e.g.
+`openssl rand -hex 32`). It is compared with constant-time equality, so the
+length and content of a wrong token do not leak through timing.
+
+```bash
+# Vercel
+vercel env add METRICS_SCRAPE_TOKEN production
+
+# Self-hosted / Docker
+METRICS_SCRAPE_TOKEN="$(openssl rand -hex 32)"
+```
+
+### Scrape configuration
+
+Prometheus must send the token as a bearer credential. Do **not** put the token
+in the URL — it would land in access logs and referrers.
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: trustbridge
+    metrics_path: /api/metrics/prometheus
+    scheme: https
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/trustbridge-scrape-token
+    static_configs:
+      - targets: ["your-domain.vercel.app"]
+```
+
+### Network policy / reverse proxy
+
+Defence in depth — restrict the route at the edge as well as with the token:
+
+- **Vercel**: put `/api/metrics/prometheus` behind a WAF/rewrite rule that only
+  allows your scraper's egress IPs, or front the app with a reverse proxy that
+  enforces an IP allowlist.
+- **Self-hosted**: add an `allow`/`deny` block in nginx for the metrics path and
+  keep the token check as the second layer.
+
+### Token rotation
+
+1. Generate a new token (`openssl rand -hex 32`).
+2. Update `METRICS_SCRAPE_TOKEN` in the platform env and redeploy.
+3. Update the scraper's `credentials_file` and reload Prometheus.
+
+Rotate on a schedule and immediately on suspected exposure. Because the check
+is a single env var, rotation is atomic — there is no dual-token window, so
+briefly expect `401`s until the scraper is updated.
+
+### Cardinality limits
+
+The Prometheus payload is bounded to keep scrape cost and storage predictable:
+
+- Labels are drawn from a fixed set (route, status, outcome); no wallet
+  addresses, GitHub usernames, or free-form input are used as label values.
+- Per-series cardinality is capped; excess series are dropped rather than
+  emitted, so a burst of distinct inputs cannot blow up the TSDB.
+- If you need higher cardinality, raise the cap deliberately and watch
+  `prometheus_tsdb_head_series` after the change.
+
+### Failure reason codes
+
+| Status | Reason | Meaning |
+|--------|--------|---------|
+| `401` | `metrics_unauthorized` | Token missing or does not match |
+| `503` | `metrics_token_not_configured` | Production without `METRICS_SCRAPE_TOKEN` |
 
 ---
 
@@ -143,6 +225,7 @@ DATABASE_URL="postgresql://trustbridge:trustbridge-dev-password@localhost:5432/t
 ## Monitoring & limits
 
 - **Grafana Dashboards & Metrics** — import ready-made dashboards in [docs/grafana/](./grafana/README.md) ([Overview JSON](./grafana/trustbridge-overview.json) / [JSON API JSON](./grafana/trustbridge-json-api.json)) for live payout readiness and health monitoring.
+- **Prometheus scrape auth** — `/api/metrics/prometheus` requires `METRICS_SCRAPE_TOKEN`; see [Prometheus metrics scrape auth](#prometheus-metrics-scrape-auth).
 - **Horizon rate limits** — batch re-check queries one account per registration; large Waves may need throttling (future enhancement)
 - **Vercel serverless timeout** — default 10s on Hobby; batch re-check may need pagination for 100+ contributors
 - **Database connections** — use connection pooling (Neon pooler, Supabase pooler, or Prisma Accelerate)
@@ -245,246 +328,3 @@ jobs:
 - [Grafana dashboards & metrics](./grafana/README.md)
 - [Setup guide](./SETUP.md)
 - [Architecture](./ARCHITECTURE.md)
-- [Contributing](./CONTRIBUTING.md)
-
----
-
-## Background Worker Process
-
-For durable background processing (such as batch rechecks across all contributors,
-single-contributor rechecks, and asynchronous notifications), TrustBridge uses a
-**database-backed queue** (`QueueJob` table in PostgreSQL) so jobs survive
-application restarts and serverless cold-starts.
-
-> [!WARNING]
-> **A separate worker process is mandatory.** Web applications running on serverless
-> platforms like Vercel or Netlify are ephemeral and terminate once an HTTP request
-> ends. If you only deploy the web application without a running worker process,
-> enqueued jobs (e.g., contributor re-checks) will remain in `pending` state and
-> **silently stall**.
-
-### Entrypoint and npm script
-
-- **NPM script:** `npm run worker`
-- **Entrypoint script:** [`scripts/worker.mjs`](../scripts/worker.mjs)
-- **Implementation file:** [`src/lib/queue-worker.ts`](../src/lib/queue-worker.ts)
-
-Under the hood, `scripts/worker.mjs` uses `jiti` to dynamically load `src/lib/queue-worker.ts`,
-registers handlers for `recheck.batch` and `recheck.single`, and calls `runWorker()`.
-The worker runs a continuous poll loop claiming pending jobs from PostgreSQL until
-terminated.
-
-You can also invoke it directly via Node or tsx:
-
-```bash
-node scripts/worker.mjs
-# or
-npx tsx scripts/worker.mjs
-```
-
----
-
-### Environment variables (shared with web process)
-
-The worker process executes the same backend registration and Horizon verification logic
-as the Next.js server actions and API routes. It must have access to the same environment
-variables as the web process:
-
-| Environment variable | Required / Optional | Purpose in Worker |
-|----------------------|---------------------|-------------------|
-| `DATABASE_URL` | **Required** | PostgreSQL connection string used to poll, claim, and update `QueueJob` rows and update contributor records. |
-| `TOKEN_ENCRYPTION_KEY` | **Required** | 32-byte base64 AES-256 key to decrypt maintainer GitHub access tokens stored in `User.accessToken` for org membership queries. |
-| `GITHUB_MAINTAINER_ORG` | **Required** | Organization slug used to verify maintainer permissions during recheck tasks. |
-| `NEXT_PUBLIC_HORIZON_URL` | **Required** | Stellar Horizon endpoint (e.g. `https://horizon.stellar.org` or `https://horizon-testnet.stellar.org`) to query balances and trustlines. |
-| `NEXT_PUBLIC_DEFAULT_ASSET_CODE` | Optional (default `USDC`) | Asset code to verify contributor trustlines against. |
-| `NEXT_PUBLIC_DEFAULT_ASSET_ISSUER` | Optional | Asset issuer public key for the custom asset trustline check. |
-| `NEXT_PUBLIC_MIN_XLM_BALANCE` | Optional (default `1`) | Minimum required spendable XLM balance for readiness status. |
-| `SOROBAN_RPC_URL` | Optional | RPC URL if Soroban smart contract verification is enabled. |
-| `SOROBAN_CONTRACT_ID` | Optional | Contract address for Soroban integration. |
-| `SENTRY_DSN` | Optional | Error reporting and sanitized stack traces if Sentry is enabled. |
-
-#### Supplying environment variables
-
-- **Local / VM with dotenv:**
-  ```bash
-  npx dotenv-cli -e .env.production -- npm run worker
-  ```
-- **Shell export:**
-  ```bash
-  export DATABASE_URL="postgresql://..."
-  export TOKEN_ENCRYPTION_KEY="..."
-  export GITHUB_MAINTAINER_ORG="stellar"
-  export NEXT_PUBLIC_HORIZON_URL="https://horizon.stellar.org"
-  npm run worker
-  ```
-
----
-
-### Starting and supervising the worker
-
-Because the worker must stay alive 24/7, run it under a process manager or container orchestrator with an automatic restart policy.
-
-#### Option A: PM2 (Node Process Manager)
-
-```bash
-# Install PM2 globally
-npm install -g pm2
-
-# Start worker with auto-restart on crash
-pm2 start npm --name "trustbridge-worker" -- run worker
-
-# Configure PM2 to start on system boot
-pm2 startup
-pm2 save
-```
-
-Or using an `ecosystem.config.cjs` file:
-
-```javascript
-module.exports = {
-  apps: [
-    {
-      name: "trustbridge-worker",
-      script: "scripts/worker.mjs",
-      interpreter: "node",
-      instances: 1,
-      autorestart: true,
-      watch: false,
-      max_memory_restart: "512M",
-      env_file: ".env.production",
-    },
-  ],
-};
-```
-
-#### Option B: Systemd Service (Linux VM / EC2)
-
-Create `/etc/systemd/system/trustbridge-worker.service`:
-
-```ini
-[Unit]
-Description=TrustBridge Queue Worker
-After=network.target postgresql.service
-
-[Service]
-Type=simple
-User=trustbridge
-WorkingDirectory=/var/www/trustbridge-dashboard
-EnvironmentFile=/var/www/trustbridge-dashboard/.env.production
-ExecStart=/usr/bin/npm run worker
-Restart=always
-RestartSec=5s
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=trustbridge-worker
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Enable and start the service:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now trustbridge-worker
-sudo systemctl status trustbridge-worker
-```
-
-#### Option C: Docker & Docker Compose
-
-In a multi-service Docker deployment, add a `worker` service alongside `web` and `postgres`:
-
-```yaml
-services:
-  worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    command: ["npm", "run", "worker"]
-    restart: unless-stopped
-    env_file:
-      - .env.production
-    depends_on:
-      postgres:
-        condition: service_healthy
-```
-
-#### Option D: PaaS (Railway, Fly.io, Render, Heroku)
-
-On PaaS providers, declare a persistent background worker process:
-
-- **Railway / Render:** Create a "Background Worker" service pointing to your repository, set the build command to `npm ci && npm run prisma:generate`, and start command to `npm run worker`.
-- **Fly.io / Procfile:**
-  ```
-  web: npm start
-  worker: npm run worker
-  ```
-
----
-
-### Restarting the worker
-
-When deploying code changes or updating environment variables:
-
-- **PM2:**
-  ```bash
-  pm2 restart trustbridge-worker
-  ```
-- **Systemd:**
-  ```bash
-  sudo systemctl restart trustbridge-worker
-  ```
-- **Docker Compose:**
-  ```bash
-  docker compose restart worker
-  ```
-
-The worker traps `SIGINT` and `SIGTERM` signals and initiates a graceful shutdown: any in-flight job finishes before the process exits.
-
----
-
-### Monitoring & health expectations
-
-#### 1. Startup & operational log messages
-
-A healthy worker produces standard log output indicating the poll loop is running:
-
-```
-Starting TrustBridge durable background worker...
-[QueueWorker] Background worker loop started.
-```
-
-When jobs are claimed and processed:
-- Completed jobs: Result details and duration are logged and stored in `QueueJob.result`.
-- Graceful shutdown: `Received SIGTERM. Shutting down worker gracefully...` followed by `[QueueWorker] Background worker loop stopped.`
-
-#### 2. Queue health and backlog inspection
-
-Monitor the PostgreSQL `QueueJob` table directly or through the admin metrics API (`GET /api/metrics`):
-
-| Metric / Indicator | Expected Healthy State | Troubleshooting / Action |
-|--------------------|------------------------|--------------------------|
-| `pendingCount` | `0` (or briefly spikes during batch checks, draining within seconds to minutes) | If `pendingCount` grows continuously or jobs stay `pending` > 1 min, the worker process is down or disconnected. |
-| `processingCount` | `0` when idle, `1`–`2` during active batches | If a job stays `processing` indefinitely after a worker hard-crash, it may require manual reset or cleanup. |
-| `failedCount` | Low or `0` | Inspect `QueueJob.error` column for sanitized error messages (Horizon rate limits, network timeouts, invalid contributor address). |
-| Process restart count | Constant (0 unexpected restarts) | High restart count indicates memory leaks, unhandled fatal exceptions, or bad environment variable configuration. |
-
-#### 3. Database query for quick triage
-
-Run against your production database to check queue status:
-
-```sql
-SELECT status, COUNT(*)
-FROM "QueueJob"
-GROUP BY status;
-```
-
-To inspect recently failed jobs:
-
-```sql
-SELECT id, type, error, "createdAt", "completedAt"
-FROM "QueueJob"
-WHERE status = 'failed'
-ORDER BY "completedAt" DESC
-LIMIT 10;
-```
