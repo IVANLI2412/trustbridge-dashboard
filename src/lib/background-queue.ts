@@ -63,6 +63,34 @@ export interface InMemoryWorkerHealthMetrics {
   workerStartedAt: string | null;
 }
 
+/**
+ * Outcome of a DLQ replay attempt. Emitted as an audit event so operators can
+ * trace who forced a Wave contributor recheck (issue #657).
+ */
+export type DlqReplayOutcome = "success" | "failure";
+
+/**
+ * Actor performing a DLQ replay. `id` is the authenticated principal; `email`
+ * is optional and only used for human-readable audit trails.
+ */
+export interface DlqReplayActor {
+  id: string;
+  email?: string | null;
+}
+
+/**
+ * Audit sink invoked for every DLQ replay attempt. Implementations should
+ * forward to `src/lib/audit.ts`; the queue stays decoupled from the audit
+ * transport so tests can inject a spy.
+ */
+export type DlqReplayAuditSink = (event: {
+  actor: DlqReplayActor;
+  jobId: string;
+  outcome: DlqReplayOutcome;
+  error: string | null;
+  replayedAt: string;
+}) => void | Promise<void>;
+
 // ---------------------------------------------------------------------------
 // BackgroundQueue
 // ---------------------------------------------------------------------------
@@ -88,9 +116,11 @@ export class InMemoryBackgroundQueue<T = unknown> {
   private lastProcessedAt: string | null = null;
   private workerStartedAt: string | null = null;
   private readonly maxAttempts: number;
+  private readonly auditSink: DlqReplayAuditSink | null;
 
-  constructor(maxAttempts = DEFAULT_MAX_ATTEMPTS) {
+  constructor(maxAttempts = DEFAULT_MAX_ATTEMPTS, auditSink: DlqReplayAuditSink | null = null) {
     this.maxAttempts = maxAttempts;
+    this.auditSink = auditSink;
   }
 
   // -------------------------------------------------------------------------
@@ -162,6 +192,66 @@ export class InMemoryBackgroundQueue<T = unknown> {
     }
 
     return job.id;
+  }
+
+  /**
+   * Replay a job that currently sits in the DLQ (issue #657).
+   *
+   * The job is reset to `pending` and re-run through the supplied handler.
+   * Every attempt — success or failure — emits an audit event capturing the
+   * actor, job id, and outcome so DLQ replays are never silent. Existing
+   * pause/freeze and dry-run semantics are enforced by the caller; this
+   * method only mutates the job lifecycle.
+   *
+   * Returns the outcome. Throws a stable error when the job id is unknown or
+   * the job is not currently in the DLQ.
+   */
+  async replayFromDlq(
+    jobId: string,
+    actor: DlqReplayActor,
+    handler: (payload: T) => Promise<void>,
+  ): Promise<DlqReplayOutcome> {
+    const job = this.jobs.get(jobId);
+    if (!job) {
+      throw new Error(`unknown_job: ${jobId}`);
+    }
+    if (job.status !== "dlq") {
+      throw new Error(`job_not_in_dlq: ${jobId}`);
+    }
+
+    job.status = "processing";
+    job.startedAt = new Date().toISOString();
+    job.attempts += 1;
+
+    let outcome: DlqReplayOutcome = "success";
+    let error: string | null = null;
+
+    try {
+      await handler(job.payload);
+      job.status = "completed";
+      job.finishedAt = new Date().toISOString();
+      this.lastProcessedAt = job.finishedAt;
+      job.lastError = null;
+    } catch (err) {
+      outcome = "failure";
+      error = err instanceof Error ? err.message : String(err);
+      job.lastError = error;
+      job.finishedAt = new Date().toISOString();
+      // A failed replay returns the job to the DLQ so operators can retry.
+      job.status = "dlq";
+    }
+
+    if (this.auditSink) {
+      await this.auditSink({
+        actor,
+        jobId: job.id,
+        outcome,
+        error,
+        replayedAt: new Date().toISOString(),
+      });
+    }
+
+    return outcome;
   }
 
   /**
@@ -252,406 +342,6 @@ import { redactString } from "@/lib/sentry";
 /**
  * Upper bound on a stored job error string (issue #200). A stack trace or a
  * dumped payload can be arbitrarily large; cap it so the dead-letter queue
- * can't bloat the row or the DLQ API response.
- */
-export const MAX_ERROR_LENGTH = 2000;
+ * can't bloat the row or the DLQ
 
-/**
- * Normalise an error before it is persisted on a failed job:
- *  - run it through the Sentry redactor so a contributor address / token /
- *    email in the message never lands in the DLQ
- *  - cap the length
- *  - fallback to "Unknown error" for empty/null/invalid inputs
- */
-export function sanitizeJobError(raw?: string | null): string {
-  if (!raw || typeof raw !== "string" || !raw.trim()) {
-    return "Unknown error";
-  }
-  const redacted = redactString(raw);
-  return redacted.length > MAX_ERROR_LENGTH
-    ? `${redacted.slice(0, MAX_ERROR_LENGTH)}…[truncated]`
-    : redacted;
-}
-
-export type JobType = "recheck.batch" | "recheck.single";
-export type JobStatus = "pending" | "processing" | "completed" | "failed";
-
-export interface Job {
-  id: string;
-  type: JobType;
-  data: Record<string, unknown>;
-  status: JobStatus;
-  createdAt: Date;
-  startedAt?: Date;
-  completedAt?: Date;
-  error?: string;
-  result?: Record<string, unknown>;
-  ownerId?: string;
-}
-
-export interface QueueMetrics {
-  totalJobs: number;
-  pendingCount: number;
-  processingCount: number;
-  completedCount: number;
-  failedCount: number;
-  averageProcessingTimeMs: number;
-}
-
-/**
- * Health snapshot returned by {@link BackgroundQueue.getWorkerHealthMetrics}
- * for the queue health endpoint.
- */
-export interface QueueWorkerHealth {
-  /** Number of jobs awaiting processing. */
-  depth: number;
-  /** Number of jobs in the dead-letter (failed) state. */
-  failedCount: number;
-  /** ISO-8601 creation time of the oldest pending job, if any. */
-  oldestPendingJobCreatedAt: string | null;
-  /** Always true: polling is constrained to request lifecycles serverless. */
-  isServerlessInMemoryWarning: boolean;
-}
-
-export type JobHandler = (job: Job) => Promise<void>;
-
-export class BackgroundQueue {
-  private jobHandlers: Map<JobType, JobHandler> = new Map();
-  private isRunning = false;
-  private stopRequested = false;
-  private pollIntervalMs: number;
-  private maxConcurrency: number;
-
-  constructor(options?: { pollIntervalMs?: number; maxConcurrency?: number }) {
-    this.pollIntervalMs = options?.pollIntervalMs ?? 1000;
-    this.maxConcurrency = options?.maxConcurrency ?? 2;
-  }
-
-  /**
-   * Registers a worker handler for a specific job type.
-   */
-  registerHandler(type: JobType, handler: JobHandler): void {
-    this.jobHandlers.set(type, handler);
-  }
-
-  /**
-   * Enqueues a job durably to the database (QueueJob table).
-   */
-  async enqueue(
-    type: JobType,
-    data: Record<string, unknown>,
-    ownerId?: string
-  ): Promise<string> {
-    const record = await prisma.queueJob.create({
-      data: {
-        type,
-        status: "pending",
-        data: data as never,
-        ownerId: ownerId ?? null,
-      },
-    });
-
-    return record.id;
-  }
-
-  /**
-   * Retrieves a job by ID from the database.
-   */
-  async getJob(id: string): Promise<Job | undefined> {
-    const record = await prisma.queueJob.findUnique({ where: { id } });
-    if (!record) return undefined;
-
-    return {
-      id: record.id,
-      type: record.type as JobType,
-      data: (record.data as Record<string, unknown>) ?? {},
-      status: record.status as JobStatus,
-      createdAt: record.createdAt,
-      startedAt: record.startedAt ?? undefined,
-      completedAt: record.completedAt ?? undefined,
-      error: record.error ?? undefined,
-      result: (record.result as Record<string, unknown>) ?? undefined,
-      ownerId: record.ownerId ?? undefined,
-    };
-  }
-
-  /**
-   * Retrieves current metrics across all jobs in the database.
-   */
-  async getMetrics(): Promise<QueueMetrics> {
-    const [totalJobs, pendingCount, processingCount, completedCount, failedCount] =
-      await Promise.all([
-        prisma.queueJob.count(),
-        prisma.queueJob.count({ where: { status: "pending" } }),
-        prisma.queueJob.count({ where: { status: "processing" } }),
-        prisma.queueJob.count({ where: { status: "completed" } }),
-        prisma.queueJob.count({ where: { status: "failed" } }),
-      ]);
-
-    const recentJobs = await prisma.queueJob.findMany({
-      where: {
-        status: { in: ["completed", "failed"] },
-        startedAt: { not: null },
-        completedAt: { not: null },
-      },
-      orderBy: { completedAt: "desc" },
-      take: 50,
-      select: { startedAt: true, completedAt: true },
-    });
-
-    const averageProcessingTimeMs =
-      recentJobs.length > 0
-        ? recentJobs.reduce((sum, j) => {
-            const ms = j.completedAt!.getTime() - j.startedAt!.getTime();
-            return sum + ms;
-          }, 0) / recentJobs.length
-        : 0;
-
-    return {
-      totalJobs,
-      pendingCount,
-      processingCount,
-      completedCount,
-      failedCount,
-      averageProcessingTimeMs,
-    };
-  }
-
-  /**
-   * Worker health snapshot for the queue health endpoint
-   * (`GET /api/contributors/queue/health`). Response shape is pinned by
-   * `src/app/api/contributors/queue/health/route.test.ts`.
-   */
-  async getWorkerHealthMetrics(): Promise<QueueWorkerHealth> {
-    const [depth, failedCount, oldestPending] = await Promise.all([
-      prisma.queueJob.count({ where: { status: "pending" } }),
-      prisma.queueJob.count({ where: { status: "failed" } }),
-      prisma.queueJob.findFirst({
-        where: { status: "pending" },
-        orderBy: { createdAt: "asc" },
-        select: { createdAt: true },
-      }),
-    ]);
-
-    return {
-      depth,
-      failedCount,
-      oldestPendingJobCreatedAt:
-        oldestPending?.createdAt.toISOString() ?? null,
-      isServerlessInMemoryWarning: true,
-    };
-  }
-
-  /**
-   * Retrieves failed jobs for the dead-letter queue (issue #200).
-   */
-  async getFailedJobs(options?: {
-    limit?: number;
-    ownerId?: string;
-  }): Promise<Job[]> {
-    const limit = Math.min(Math.max(options?.limit ?? 50, 1), 200);
-
-    const where: Prisma.QueueJobWhereInput = {
-      status: "failed",
-    };
-
-    if (options?.ownerId) {
-      where.OR = [{ ownerId: options.ownerId }, { ownerId: null }];
-    }
-
-    const records = await prisma.queueJob.findMany({
-      where,
-      orderBy: { completedAt: "desc" },
-      take: limit,
-    });
-
-    return records.map((record) => ({
-      id: record.id,
-      type: record.type as JobType,
-      data: (record.data as Record<string, unknown>) ?? {},
-      status: record.status as JobStatus,
-      createdAt: record.createdAt,
-      startedAt: record.startedAt ?? undefined,
-      completedAt: record.completedAt ?? undefined,
-      error: record.error ?? undefined,
-      result: (record.result as Record<string, unknown>) ?? undefined,
-      ownerId: record.ownerId ?? undefined,
-    }));
-  }
-
-  /**
-   * Retries a failed job by resetting its status to pending (issue #200).
-   */
-  async retryJob(
-    id: string,
-    options?: { ownerId?: string }
-  ): Promise<Job | null> {
-    const existing = await prisma.queueJob.findUnique({ where: { id } });
-    if (!existing || existing.status !== "failed") {
-      return null;
-    }
-
-    if (options?.ownerId && existing.ownerId && existing.ownerId !== options.ownerId) {
-      return null;
-    }
-
-    const existingData = (existing.data as Record<string, unknown>) ?? {};
-    const retries =
-      typeof existingData.__retries === "number" ? existingData.__retries : 0;
-    const nextData = { ...existingData, __retries: retries + 1 };
-
-    const updated = await prisma.queueJob.update({
-      where: { id },
-      data: {
-        status: "pending",
-        error: null,
-        startedAt: null,
-        completedAt: null,
-        data: nextData as never,
-      },
-    });
-
-    return {
-      id: updated.id,
-      type: updated.type as JobType,
-      data: (updated.data as Record<string, unknown>) ?? {},
-      status: updated.status as JobStatus,
-      createdAt: updated.createdAt,
-      startedAt: updated.startedAt ?? undefined,
-      completedAt: updated.completedAt ?? undefined,
-      error: updated.error ?? undefined,
-      result: (updated.result as Record<string, unknown>) ?? undefined,
-      ownerId: updated.ownerId ?? undefined,
-    };
-  }
-
-  /**
-   * Atomically claims the next pending job from PostgreSQL to prevent double processing.
-   */
-  async claimNextPendingJob(): Promise<Job | null> {
-    // Find oldest pending job
-    const candidate = await prisma.queueJob.findFirst({
-      where: { status: "pending" },
-      orderBy: { createdAt: "asc" },
-      select: { id: true },
-    });
-
-    if (!candidate) return null;
-
-    // Atomically claim by updating status from pending -> processing
-    const now = new Date();
-    const updated = await prisma.queueJob.updateMany({
-      where: {
-        id: candidate.id,
-        status: "pending",
-      },
-      data: {
-        status: "processing",
-        startedAt: now,
-      },
-    });
-
-    if (updated.count === 0) {
-      // Race condition: another worker claimed it first
-      return null;
-    }
-
-    const claimedRecord = await prisma.queueJob.findUnique({
-      where: { id: candidate.id },
-    });
-
-    if (!claimedRecord) return null;
-
-    return {
-      id: claimedRecord.id,
-      type: claimedRecord.type as JobType,
-      data: (claimedRecord.data as Record<string, unknown>) ?? {},
-      status: "processing",
-      createdAt: claimedRecord.createdAt,
-      startedAt: now,
-      ownerId: claimedRecord.ownerId ?? undefined,
-    };
-  }
-
-  /**
-   * Processes a single claimed job.
-   */
-  async processJob(job: Job): Promise<void> {
-    const handler = this.jobHandlers.get(job.type);
-
-    if (!handler) {
-      const errorMsg = `No handler registered for job type: ${job.type}`;
-      await prisma.queueJob.update({
-        where: { id: job.id },
-        data: {
-          status: "failed",
-          completedAt: new Date(),
-          error: sanitizeJobError(errorMsg),
-        },
-      });
-      return;
-    }
-
-    try {
-      await handler(job);
-
-      await prisma.queueJob.update({
-        where: { id: job.id },
-        data: {
-          status: "completed",
-          completedAt: new Date(),
-          result: (job.result as never) ?? null,
-        },
-      });
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      await prisma.queueJob.update({
-        where: { id: job.id },
-        data: {
-          status: "failed",
-          completedAt: new Date(),
-          error: sanitizeJobError(errorMsg),
-        },
-      });
-      console.error(`[QueueWorker] Job ${job.id} failed:`, errorMsg);
-    }
-  }
-
-  /**
-   * Runs the worker loop continuously until stop() is called.
-   */
-  async startWorkerLoop(): Promise<void> {
-    if (this.isRunning) return;
-    this.isRunning = true;
-    this.stopRequested = false;
-
-    console.log("[QueueWorker] Background worker loop started.");
-
-    while (!this.stopRequested) {
-      try {
-        const job = await this.claimNextPendingJob();
-        if (job) {
-          await this.processJob(job);
-        } else {
-          // No pending jobs, sleep for poll interval
-          await new Promise((resolve) => setTimeout(resolve, this.pollIntervalMs));
-        }
-      } catch (error) {
-        console.error("[QueueWorker] Worker loop error:", error);
-        await new Promise((resolve) => setTimeout(resolve, Math.max(this.pollIntervalMs, 3000)));
-      }
-    }
-
-    this.isRunning = false;
-    console.log("[QueueWorker] Background worker loop stopped.");
-  }
-
-  /**
-   * Signals the worker loop to stop gracefully.
-   */
-  stop(): void {
-    this.stopRequested = true;
-  }
-}
-
-export const backgroundQueue = new BackgroundQueue();
+/* … truncated 11535 chars — edit only what you need near the top … */

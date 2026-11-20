@@ -64,6 +64,59 @@ export function hasScope(scopes: string[], required: ApiKeyScope): boolean {
   return hasApiKeyScope(scopes, required);
 }
 
+/**
+ * Stable, machine-readable reasons an API-key scope check is rejected.
+ * Routes map these to HTTP status codes so the least-privilege matrix is
+ * deterministic and testable.
+ */
+export type ApiKeyScopeRejection =
+  | "missing_scope"
+  | "insufficient_scope";
+
+/**
+ * Result of enforcing a required scope on an authenticated key.
+ *
+ * - `ok`       → the key covers the required scope.
+ * - `rejected` → the key is missing the scope; return the mapped status.
+ */
+export type ApiKeyScopeCheck =
+  | { ok: true }
+  | { ok: false; reason: ApiKeyScopeRejection; required: ApiKeyScope };
+
+/**
+ * Enforce least privilege for a single required scope on an already
+ * authenticated key. Export/CSV/JSON routes must call this with an explicit
+ * `export:*` scope so read-only keys cannot fall back to broad read/write
+ * grants.
+ *
+ * Returns `{ ok: true }` when the key covers `required`, otherwise a stable
+ * rejection reason the route maps to a 403.
+ */
+export function enforceApiKeyScope(
+  key: Pick<AuthenticatedApiKey, "scopes">,
+  required: ApiKeyScope
+): ApiKeyScopeCheck {
+  if (!Array.isArray(key.scopes) || key.scopes.length === 0) {
+    return { ok: false, reason: "missing_scope", required };
+  }
+
+  if (!hasApiKeyScope(key.scopes, required)) {
+    return { ok: false, reason: "insufficient_scope", required };
+  }
+
+  return { ok: true };
+}
+
+/** Map an API-key scope rejection reason to the HTTP status a route returns. */
+export function apiKeyScopeRejectionStatus(reason: ApiKeyScopeRejection): number {
+  switch (reason) {
+    case "missing_scope":
+      return 403;
+    case "insufficient_scope":
+      return 403;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Dual-auth matrix
 // ---------------------------------------------------------------------------
@@ -246,20 +299,25 @@ export async function authenticateApiKey(
     return null;
   }
 
-  if (key.expiresAt && key.expiresAt < now) {
+  if (key.expiresAt && key.expiresAt <= now) {
     await recordAuditLog({
       action: "api_key.use_rejected",
       targetId: key.id,
       targetLabel: key.name,
-      metadata: { reason: "expired", expiredAt: key.expiresAt.toISOString() },
+      metadata: { reason: "expired" },
     });
     return null;
   }
 
-  // ── 5. Update lastUsedAt (best-effort, non-blocking) ────────────────────
-  prisma.apiKey
-    .update({ where: { id: key.id }, data: { lastUsedAt: now } })
-    .catch(() => {/* best-effort */ });
+  // ── 5. Update lastUsedAt (best-effort) ────────────────────────────────────
+  try {
+    await prisma.apiKey.update({
+      where: { id: key.id },
+      data: { lastUsedAt: now },
+    });
+  } catch {
+    // Non-fatal: auth already succeeded.
+  }
 
   return {
     id: key.id,
@@ -271,48 +329,78 @@ export async function authenticateApiKey(
 }
 
 /**
- * Authenticate an API key and enforce that it carries `requiredScope`.
- * Thin wrapper over {@link authenticateApiKey}; returns `null` when the key
- * is missing/invalid/expired/revoked or lacks the scope, so existing callers
- * keep their 401 behaviour. Prefer {@link authenticateApiKey} plus
- * {@link insufficientScopeResponse} when a stable 403 is required.
+ * Authenticate an API key and enforce a single required scope.
+ *
+ * Returns the key record on success, `null` on auth failure, a
+ * `{ rateLimited: true }` marker when the IP is rate-limited, or a
+ * `{ forbidden: true, reason }` marker when the key is missing the scope.
+ * Routes map these markers to 429/403 responses so the least-privilege
+ * matrix is deterministic and testable.
  */
 export async function requireApiKeyScope(
   request: NextRequest,
-  requiredScope: ApiKeyScope
+  required: ApiKeyScope
 ): Promise<
   | AuthenticatedApiKey
   | { rateLimited: true; result: { allowed: false; retryAfter: number; remaining: number } }
+  | { forbidden: true; reason: ApiKeyScopeRejection; required: ApiKeyScope }
   | null
 > {
   const auth = await authenticateApiKey(request);
-  if (!auth || "rateLimited" in auth) return auth;
-  if (!hasScope(auth.scopes, requiredScope)) {
+
+  if (auth === null) {
+    return null;
+  }
+
+  if ("rateLimited" in auth) {
+    return auth;
+  }
+
+  const check = enforceApiKeyScope(auth, required);
+  if (!check.ok) {
     await recordAuditLog({
       action: "api_key.use_rejected",
       targetId: auth.id,
       targetLabel: auth.name,
-      metadata: { reason: "insufficient_scope", required: requiredScope, actual: auth.scopes },
+      metadata: { reason: check.reason, required },
     });
-    return null;
+    return { forbidden: true, reason: check.reason, required };
   }
+
   return auth;
 }
 
 /**
- * Stable 403 response for a valid API key that lacks the required scope.
- * No stack traces or key material — safe to return verbatim.
+ * Build a 403 response for a scope rejection. Routes call this when
+ * `requireApiKeyScope` returns a `{ forbidden: true }` marker so the
+ * least-privilege matrix surfaces a stable, documented error body.
  */
-export function insufficientScopeResponse(requiredScope: ApiKeyScope) {
+export function apiKeyScopeForbiddenResponse(
+  reason: ApiKeyScopeRejection,
+  required: ApiKeyScope
+): NextResponse {
   return NextResponse.json(
-    {
-      error: "Forbidden: API key lacks the required scope",
-      code: "insufficient_scope",
-      requiredScope,
-    },
-    { status: 403 }
+    { error: "Forbidden", reason, required },
+    { status: apiKeyScopeRejectionStatus(reason) }
   );
 }
 
-// Re-export so callers only need to import from this module.
-export { buildRateLimitHeaders, API_KEY_RATE_LIMIT };
+/**
+ * Build a 429 response for a rate-limited API-key request. Routes call this
+ * when `requireApiKeyScope` returns a `{ rateLimited: true }` marker.
+ */
+export function apiKeyRateLimitedResponse(result: {
+  retryAfter: number;
+  remaining: number;
+}): NextResponse {
+  return NextResponse.json(
+    { error: "Too many requests" },
+    {
+      status: 429,
+      headers: buildRateLimitHeaders(
+        { allowed: false, retryAfter: result.retryAfter, remaining: result.remaining },
+        API_KEY_RATE_LIMIT.maxRequests
+      ),
+    }
+  );
+}
