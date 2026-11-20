@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { timingSafeEqual } from "node:crypto";
 
 import { requireOperator } from "@/lib/api-auth";
 import { getContractSyncAlertMetrics, getContractSyncLagState } from "@/lib/contract-sync";
@@ -56,12 +57,29 @@ function getBearerToken(request: NextRequest): string | null {
   return token;
 }
 
+function constantTimeEquals(a: string, b: string): boolean {
+  const aBuf = Buffer.from(a, "utf8");
+  const bBuf = Buffer.from(b, "utf8");
+  if (aBuf.length !== bBuf.length) return false;
+  return timingSafeEqual(aBuf, bBuf);
+}
+
 function isScraperAllowlisted(bearerToken: string | null): boolean {
   if (!bearerToken) return false;
   const allowlistRaw = process.env.PROMETHEUS_SCRAPE_TOKENS;
   if (!allowlistRaw) return false;
   const tokens = allowlistRaw.split(",").map((t) => t.trim()).filter(Boolean);
-  return tokens.some((t) => t.length > 0 && t === bearerToken);
+  return tokens.some((t) => t.length > 0 && constantTimeEquals(t, bearerToken));
+}
+
+function isProduction(): boolean {
+  return process.env.NODE_ENV === "production";
+}
+
+function isScrapeTokenConfigured(): boolean {
+  const raw = process.env.PROMETHEUS_SCRAPE_TOKENS;
+  if (!raw) return false;
+  return raw.split(",").some((t) => t.trim().length > 0);
 }
 
 export async function GET(request: NextRequest) {
@@ -69,9 +87,26 @@ export async function GET(request: NextRequest) {
   const allowlisted = isScraperAllowlisted(bearerToken);
 
   if (!allowlisted) {
+    // In production, refuse to serve metrics unless a scrape token is configured
+    // and presented. This prevents world-readable metrics from leaking Wave
+    // volume and internal labels. Operators must set PROMETHEUS_SCRAPE_TOKENS
+    // and configure their scraper with a matching Bearer token.
+    if (isProduction() && !isScrapeTokenConfigured()) {
+      return NextResponse.json(
+        {
+          error: "Metrics scrape token not configured",
+          reason: "metrics_scrape_token_unconfigured",
+        },
+        { status: 503 },
+      );
+    }
+
     const session = await requireOperator("metrics.prometheus.read");
     if (!session) {
-      return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+      return NextResponse.json(
+        { error: "Forbidden", reason: "metrics_scrape_unauthorized" },
+        { status: 403 },
+      );
     }
   }
 

@@ -241,4 +241,60 @@ export async function resolveDualAuth(
     : { ok: false, presented, session: null, error: "invalid_api_key" };
 }
 
+/**
+ * GraphQL abuse-protection limits. These bound the cost of a single GraphQL
+ * operation so a deeply nested or wide query cannot be used as a cheap DoS
+ * against the Wave dashboard during traffic spikes.
+ *
+ * Operators can override the defaults via environment variables:
+ * - `GRAPHQL_MAX_DEPTH` (default 10)
+ * - `GRAPHQL_MAX_COMPLEXITY` (default 1000)
+ *
+ * Introspection is disabled in production unless `GRAPHQL_ALLOW_INTROSPECTION`
+ * is set to `"true"` (useful for trusted tooling).
+ */
+export const GRAPHQL_DEFAULT_MAX_DEPTH = 10;
+export const GRAPHQL_DEFAULT_MAX_COMPLEXITY = 1000;
+
+/**
+ * Stable reason codes returned when a GraphQL operation is rejected by the
+ * abuse-protection limits. Documented in `docs/ARCHITECTURE.md`.
+ */
+export type GraphQLLimitReasonCode =
+  | "graphql_depth_exceeded"
+  | "graphql_complexity_exceeded"
+  | "graphql_introspection_disabled";
+
+function readPositiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return parsed;
+}
+
+/**
+ * Resolve the effective GraphQL depth/complexity limits from the environment,
+ * falling back to the documented defaults when unset or invalid.
+ */
+export function getGraphQLLimits(): { maxDepth: number; maxComplexity: number } {
+  return {
+    maxDepth: readPositiveIntEnv("GRAPHQL_MAX_DEPTH", GRAPHQL_DEFAULT_MAX_DEPTH),
+    maxComplexity: readPositiveIntEnv(
+      "GRAPHQL_MAX_COMPLEXITY",
+      GRAPHQL_DEFAULT_MAX_COMPLEXITY
+    ),
+  };
+}
+
+/**
+ * Whether GraphQL introspection is permitted. Disabled in production unless
+ * explicitly opted in via `GRAPHQL_ALLOW_INTROSPECTION=true`; always allowed
+ * outside production so local tooling keeps working.
+ */
+export function isGraphQLIntrospectionAllowed(): boolean {
+  if (process.env.NODE_ENV !== "production") return true;
+  return process.env.GRAPHQL_ALLOW_INTROSPECTION?.trim().toLowerCase() === "true";
+}
+
 export { hasMinimumRole, ROLE_HIERARCHY };
