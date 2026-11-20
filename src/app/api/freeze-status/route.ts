@@ -27,13 +27,22 @@ export const dynamic = "force-dynamic";
  *   fallback from extractClientIp() so the route never crashes; in practice a
  *   CDN should resolve true unknowns before they reach the origin.
  *
+ * Timezone display (issue #656):
+ *   Instants are always emitted as UTC ISO-8601 (`start` / `end`).  When the
+ *   org has a configured timezone, the payload additionally carries
+ *   `timezone` (IANA name) and `display` (human-readable window rendered in
+ *   that zone, DST-aware).  When no timezone is configured these fields are
+ *   `null` and consumers fall back to UTC — preserving prior behavior.
+ *
  * Shape (200):
  * ```json
  * {
  *   "active": true,
  *   "reason": "Wave roster payout freeze window in effect",
  *   "start":  "2026-09-24T18:00:00.000Z",
- *   "end":    "2026-09-25T06:00:00.000Z"
+ *   "end":    "2026-09-25T06:00:00.000Z",
+ *   "timezone": "America/New_York",
+ *   "display": "Sep 24, 2026, 2:00 PM – Sep 25, 2026, 2:00 AM EDT"
  * }
  * ```
  *
@@ -85,6 +94,11 @@ export async function GET(request: NextRequest) {
       reason: status.reason ?? null,
       start: status.start?.toISOString() ?? null,
       end: status.end?.toISOString() ?? null,
+      // Org-timezone display (issue #656).  Optional fields — older
+      // freeze-window implementations that don't expose them yield null so
+      // the payload shape stays backward compatible.
+      timezone: status.timezone ?? null,
+      display: status.display ?? null,
     },
     {
       status: 200,

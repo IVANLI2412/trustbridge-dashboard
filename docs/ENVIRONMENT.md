@@ -247,6 +247,14 @@ FREEZE_WINDOW_ENABLED=false
 > [`docs/FEATURE_FLAGS.md`](./FEATURE_FLAGS.md) for the complementary
 > `maintenance_mode` feature flag.
 
+### `FEATURE_FLAG_<KEY>_ROLLOUT_PERCENT`
+
+Optional integer `0`–`100` sticky percentage rollout for a feature flag
+(issue #661). Unset or invalid values are ignored (full audience when the flag
+is on). See [FEATURE_FLAGS.md](./FEATURE_FLAGS.md#percentage-rollouts-sticky-bucketing-issue-661)
+for the FNV-1a bucketing algorithm and the flags API auth rules.
+
+
 ---
 
 ### `REGISTRY_MODE`
@@ -415,6 +423,39 @@ PostHog ingestion host for server-side events. Defaults to `https://app.posthog.
 ### `CONTRACT_SYNC_MIN_INTERVAL_MS`
 
 Minimum time between `/api/contract-sync` runs; a trigger inside this window returns `{ status: "skipped" }` instead of re-running Horizon checks for every registration. Defaults to `60000` (1 minute).
+
+### `CONTRACT_SYNC_LAG_THRESHOLD_MS`
+
+Age of contract-sync progress (last successful run / last RPC cursor advance)
+that is reported as **lagging**. Non-positive or invalid values fall back to
+the default. Defaults to `900000` (15 minutes). See
+[ARCHITECTURE.md](./ARCHITECTURE.md#lag-monitoring-health--alerts-issue-659)
+for the reason codes and where the value is exposed.
+
+### `CONTRACT_SYNC_STALL_THRESHOLD_MS`
+
+Age of contract-sync progress (or of the frozen Soroban RPC cursor) that is
+reported as **stalled**. Non-positive or invalid values fall back to the
+default. Defaults to `3600000` (60 minutes).
+
+### `CONTRACT_SYNC_ALERT_WEBHOOK_URL`
+
+Optional maintainer notification webhook for contract-sync lag/stall episodes
+(Slack-style `text` payload, optional PagerDuty `routing_key`). When unset,
+lag alerts are disabled (the default) — health and metrics still expose the
+lag state. Delivery is fire-and-forget with a 5s timeout and is redacted
+before leaving the process; a delivery failure never affects sync results.
+
+### `CONTRACT_SYNC_ALERT_PAGERDUTY_KEY`
+
+Optional PagerDuty Events API v2 routing key appended to the lag-alert payload
+sent to `CONTRACT_SYNC_ALERT_WEBHOOK_URL`. Unset = plain Slack-style payload.
+
+### `CONTRACT_SYNC_ALERT_COOLDOWN_MS`
+
+Minimum interval between lag-alert delivery attempts. Bounds retries after a
+failed delivery and rapid alert/recovery flapping. Non-positive or invalid
+values fall back to the default. Defaults to `1800000` (30 minutes).
 
 ---
 
@@ -641,6 +682,13 @@ Destination email address for digest emails.
   when unset, so teams with a single ops address only need to set one variable.
 - When all three are unset the digest still runs and writes an audit log entry,
   but no email is sent.
+
+### `DIGEST_QUIET_HOURS` / `DIGEST_TIMEZONE`
+
+Optional quiet-hours window (`HH:MM-HH:MM`, 24h) during which scheduled digests
+are skipped, evaluated in the IANA timezone `DIGEST_TIMEZONE` (default `UTC`).
+Invalid values are logged and ignored. See
+[DIGEST.md — Quiet hours and timezones](./DIGEST.md#quiet-hours-and-timezones).
 
 ### `DIGEST_CADENCE`
 

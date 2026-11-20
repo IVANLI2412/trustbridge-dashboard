@@ -162,3 +162,14 @@ Copy `.env.example` and set `NEXT_PUBLIC_HORIZON_URL` explicitly (mainnet
 anymore. If you set `SOROBAN_CONTRACT_ID`, also set `SOROBAN_RPC_URL` to an
 http(s) endpoint on the same network, or boot will stop with a named error.
 See [ENVIRONMENT.md — Boot-time network validation](./ENVIRONMENT.md#boot-time-network-validation-683).
+
+---
+
+## Appendix: Checklist idempotency keys (#688)
+
+`PATCH /api/register/checklist` accepts an optional `Idempotency-Key` header
+(8–128 chars, `[A-Za-z0-9_-]`) for retry-safe double submits. Keys are scoped
+by org and user; the first successful response is replayed for **5 minutes**
+(default; override with `CHECKLIST_IDEMPOTENCY_TTL_MS` in milliseconds) with
+`X-Idempotent-Replay: true`. Requests without the header behave as before.
+See [CHECKLIST_IDEMPOTENCY.md](./CHECKLIST_IDEMPOTENCY.md).

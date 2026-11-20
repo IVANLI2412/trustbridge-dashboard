@@ -96,6 +96,101 @@ export function isFullListEnabled(): boolean {
   return raw === "true" || raw === "1" || raw === "yes";
 }
 
+/**
+ * Org timezone used to render freeze windows in the digest. Mirrors the
+ * resolution used by `src/lib/freeze-window.ts` so operator-facing copy stays
+ * consistent with the freeze-status API. Falls back to UTC when unset or
+ * invalid so digests never fail on a bad env value.
+ */
+export function getDigestOrgTimezone(): string {
+  const raw = process.env.ORG_TIMEZONE?.trim();
+  if (!raw) return "UTC";
+  try {
+    // Throws RangeError for unknown IANA zones.
+    new Intl.DateTimeFormat("en-US", { timeZone: raw });
+    return raw;
+  } catch {
+    logger.warn("cron_digest_invalid_org_timezone", { timezone: raw });
+    return "UTC";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Quiet hours (#696)
+// ---------------------------------------------------------------------------
+
+export interface QuietHoursConfig {
+  /** Minutes after local midnight when quiet hours begin (inclusive). */
+  startMinute: number;
+  /** Minutes after local midnight when quiet hours end (exclusive). */
+  endMinute: number;
+  /** IANA timezone the window is evaluated in. */
+  timeZone: string;
+}
+
+const QUIET_HOURS_PATTERN = /^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$/;
+
+function isValidTimeZone(timeZone: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Parse `DIGEST_QUIET_HOURS` ("HH:MM-HH:MM", 24h) and `DIGEST_TIMEZONE`
+ * (IANA name, default "UTC"). Returns null when quiet hours are unset or
+ * misconfigured; a bad value is logged and never blocks the digest.
+ */
+export function getQuietHoursConfig(): QuietHoursConfig | null {
+  const raw = process.env.DIGEST_QUIET_HOURS?.trim();
+  if (!raw) return null;
+
+  const match = QUIET_HOURS_PATTERN.exec(raw);
+  if (!match) {
+    logger.warn("cron_digest_quiet_hours_invalid", { value: raw });
+    return null;
+  }
+  const startMinute = Number(match[1]) * 60 + Number(match[2]);
+  const endMinute = Number(match[3]) * 60 + Number(match[4]);
+  if (startMinute === endMinute) {
+    logger.warn("cron_digest_quiet_hours_empty", { value: raw });
+    return null;
+  }
+
+  const timeZone = process.env.DIGEST_TIMEZONE?.trim() || "UTC";
+  if (!isValidTimeZone(timeZone)) {
+    logger.warn("cron_digest_timezone_invalid", { value: timeZone });
+    return null;
+  }
+
+  return { startMinute, endMinute, timeZone };
+}
+
+/**
+ * True when `at` falls inside the quiet window in the configured timezone.
+ * Windows may cross midnight (e.g. 22:00-07:00). DST is handled by
+ * evaluating the wall-clock time in `timeZone` via Intl.
+ */
+export function isWithinQuietHours(at: Date, config: QuietHoursConfig): boolean {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: config.timeZone,
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(at);
+  const hour = Number(parts.find((p) => p.type === "hour")?.value ?? 0);
+  const minute = Number(parts.find((p) => p.type === "minute")?.value ?? 0);
+  const local = hour * 60 + minute;
+
+  const { startMinute, endMinute } = config;
+  return startMinute < endMinute
+    ? local >= startMinute && local < endMinute
+    : local >= startMinute || local < endMinute;
+}
+
 // ---------------------------------------------------------------------------
 // Rate gate (in-process; mirrors cron-export.ts)
 // ---------------------------------------------------------------------------
@@ -160,12 +255,32 @@ export async function runCronDigest(
     };
   }
 
+  // ── Quiet hours ───────────────────────────────────────────────────────────
+  // Checked before lastRunAt is set, so a skipped run never rate-limits the
+  // first run after quiet hours end. Manual `force` runs are not deferred.
+  const quietHours = getQuietHoursConfig();
+  if (!options.force && quietHours && isWithinQuietHours(new Date(now), quietHours)) {
+    logger.info("cron_digest_skipped_quiet_hours", { timeZone: quietHours.timeZone });
+    return {
+      status: "skipped",
+      startedAt: new Date(now).toISOString(),
+      durationMs: 0,
+      error: `Quiet hours: digests are not sent during DIGEST_QUIET_HOURS (${quietHours.timeZone})`,
+    };
+  }
+
   lastRunAt = now;
   const startedAt = new Date(now).toISOString();
   const cadence = options.cadence ?? getConfiguredCadence();
   const includeFullList = isFullListEnabled();
+  const orgTimezone = getDigestOrgTimezone();
 
-  logger.info("cron_digest_started", { startedAt, cadence, includeFullList });
+  logger.info("cron_digest_started", {
+    startedAt,
+    cadence,
+    includeFullList,
+    orgTimezone,
+  });
 
   try {
     // ── Fetch all active registrations ───────────────────────────────────────
@@ -227,6 +342,7 @@ export async function runCronDigest(
         notReadyCount,
         notReadyList: includeFullList ? notReadyList : undefined,
         generatedAt: startedAt,
+        orgTimezone,
       });
 
       const cadenceLabel = cadence === "weekly" ? "Weekly" : "Daily";
@@ -250,64 +366,4 @@ export async function runCronDigest(
 
     await recordAuditLog({
       action: "digest.cron",
-      actorId: options.actorId ?? null,
-      actorLogin: options.actorLogin ?? "scheduler:cron",
-      metadata: {
-        cadence,
-        totalContributors,
-        readyCount,
-        lowReserveCount,
-        notReadyCount,
-        includeFullList,
-        destination: destination || "none",
-        emailSent,
-        durationMs,
-      },
-    });
-
-    lastResult = {
-      status: "ok",
-      startedAt,
-      durationMs,
-      cadence,
-      totalContributors,
-      readyCount,
-      lowReserveCount,
-      notReadyCount,
-      notReadyList: includeFullList ? notReadyList : undefined,
-      destination: destination || undefined,
-      emailSent,
-    };
-
-    logger.info("cron_digest_completed", {
-      totalContributors,
-      readyCount,
-      notReadyCount,
-      cadence,
-      durationMs,
-    });
-
-    return lastResult;
-  } catch (error) {
-    const durationMs = Date.now() - now;
-    const message = error instanceof Error ? error.message : String(error);
-
-    logger.error("cron_digest_failed", { error: message, durationMs });
-
-    await recordAuditLog({
-      action: "digest.cron.failed",
-      actorId: options.actorId ?? null,
-      actorLogin: options.actorLogin ?? "scheduler:cron",
-      metadata: { error: message, durationMs },
-    });
-
-    lastResult = {
-      status: "error",
-      startedAt,
-      durationMs,
-      error: message,
-    };
-
-    return lastResult;
-  }
-}
+      actorId: options
