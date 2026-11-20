@@ -17,6 +17,9 @@ export interface FreezeWindowStatus {
  *   "false" explicitly disables the window regardless of start/end.
  * - FREEZE_WINDOW_START: ISO-8601 timestamp (e.g. 2025-01-01T00:00:00Z).
  * - FREEZE_WINDOW_END: ISO-8601 timestamp (e.g. 2025-01-08T00:00:00Z).
+ * - FREEZE_WINDOW_TIMEZONE: IANA timezone used for display only (e.g.
+ *   "America/New_York"). Defaults to "UTC". Storage and comparisons always
+ *   use UTC instants; this only affects human-facing rendering.
  *
  * The window is active when now is within [start, end] inclusive. Missing,
  * unparseable, or inverted (start > end) values fail closed to inactive.
@@ -60,6 +63,77 @@ export function isFreezeWindowActive(now = new Date()): FreezeWindowStatus {
   }
 
   return { active: false, start, end };
+}
+
+/**
+ * Resolves the org-configured display timezone. Falls back to "UTC" when the
+ * env var is missing or not a valid IANA zone so display never throws.
+ */
+export function getFreezeWindowTimezone(): string {
+  const tz = process.env.FREEZE_WINDOW_TIMEZONE?.trim();
+  if (!tz) {
+    return "UTC";
+  }
+  try {
+    // Throws RangeError for invalid IANA zones.
+    new Intl.DateTimeFormat("en-US", { timeZone: tz });
+    return tz;
+  } catch {
+    return "UTC";
+  }
+}
+
+/**
+ * Formats a UTC instant for display in the org timezone. Returns null for
+ * missing/invalid dates so callers can omit the field. DST boundaries are
+ * handled by Intl, which resolves the correct offset for the given instant.
+ */
+export function formatFreezeInstant(
+  date: Date | undefined,
+  timeZone = getFreezeWindowTimezone()
+): string | null {
+  if (!date || isNaN(date.getTime())) {
+    return null;
+  }
+  try {
+    return new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      dateStyle: "medium",
+      timeStyle: "long",
+    }).format(date);
+  } catch {
+    return new Intl.DateTimeFormat("en-US", {
+      timeZone: "UTC",
+      dateStyle: "medium",
+      timeStyle: "long",
+    }).format(date);
+  }
+}
+
+/**
+ * Builds the timezone-aware freeze window payload shared by the API route and
+ * the cron digest. UTC instants are always included; display strings are
+ * rendered in the org timezone.
+ */
+export function buildFreezeWindowPayload(status: FreezeWindowStatus): {
+  active: boolean;
+  reason?: string;
+  start: string | null;
+  end: string | null;
+  timezone: string;
+  startDisplay: string | null;
+  endDisplay: string | null;
+} {
+  const timezone = getFreezeWindowTimezone();
+  return {
+    active: status.active,
+    reason: status.reason,
+    start: status.start?.toISOString() ?? null,
+    end: status.end?.toISOString() ?? null,
+    timezone,
+    startDisplay: formatFreezeInstant(status.start, timezone),
+    endDisplay: formatFreezeInstant(status.end, timezone),
+  };
 }
 
 /**
@@ -123,6 +197,8 @@ export async function enforceFreezeWindowGuard({
     },
   });
 
+  const freezeWindow = buildFreezeWindowPayload(status);
+
   return {
     blocked: true,
     isOverride: false,
@@ -131,12 +207,7 @@ export async function enforceFreezeWindowGuard({
         error:
           "Roster is currently frozen for wave payout. Address changes and rechecks are temporarily disabled.",
         code: "WAVE_FREEZE_ACTIVE",
-        freezeWindow: {
-          active: true,
-          reason: status.reason,
-          start: status.start?.toISOString(),
-          end: status.end?.toISOString(),
-        },
+        freezeWindow,
       },
       { status: 423 }
     ),

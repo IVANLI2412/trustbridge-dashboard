@@ -125,6 +125,33 @@ export async function recordRetentionDryRunAudit(input: {
       candidateCount: input.candidateCount,
       cutoff: input.cutoff,
       reasonCode: input.reasonCode ?? null,
+
+ * Record a DLQ replay attempt (success or failure).
+ *
+ * Wraps {@link recordAuditLog} with the canonical action name and a stable
+ * metadata shape so the DLQ replay trail captures who forced a Wave
+ * contributor recheck, which job was replayed, and the outcome. Best-effort
+ * like the underlying helper: an audit failure must not break the replay.
+ */
+export async function recordDlqReplayAudit(input: {
+  actorId?: string | null;
+  actorLogin?: string | null;
+  jobId: string;
+  outcome: "success" | "failure";
+  reason?: string | null;
+  error?: string | null;
+}): Promise<void> {
+  await recordAuditLog({
+    action: "queue.dlq.replay",
+    actorId: input.actorId ?? null,
+    actorLogin: input.actorLogin ?? null,
+    targetId: input.jobId,
+    targetLabel: input.jobId,
+    metadata: {
+      jobId: input.jobId,
+      outcome: input.outcome,
+      reason: input.reason ?? null,
+      error: input.error ?? null,
     },
   });
 }
