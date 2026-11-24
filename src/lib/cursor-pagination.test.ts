@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { PAGINATION_LIMITS } from "@/lib/constants";
 
 import {
   encodeCursor,
@@ -42,7 +43,8 @@ describe("Cursor Pagination", () => {
     it("uses default limit of 50 when not provided", () => {
       const result = validatePaginationOptions({});
 
-      expect(result.limit).toBe(50);
+      expect(result.limit).toBe(PAGINATION_LIMITS.cursorDefault);
+      expect(PAGINATION_LIMITS.cursorDefault).toBe(50);
       expect(result.decodedCursor).toBeNull();
     });
 
@@ -55,13 +57,15 @@ describe("Cursor Pagination", () => {
     it("enforces maximum limit of 100", () => {
       const result = validatePaginationOptions({ limit: 500 });
 
-      expect(result.limit).toBe(100);
+      expect(result.limit).toBe(PAGINATION_LIMITS.max);
+      expect(PAGINATION_LIMITS.max).toBe(100);
     });
 
     it("enforces minimum limit of 1", () => {
       const result = validatePaginationOptions({ limit: 0 });
 
-      expect(result.limit).toBe(1);
+      expect(result.limit).toBe(PAGINATION_LIMITS.min);
+      expect(PAGINATION_LIMITS.min).toBe(1);
     });
 
     it("decodes provided cursor", () => {

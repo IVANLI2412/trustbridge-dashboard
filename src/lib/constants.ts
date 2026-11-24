@@ -187,3 +187,18 @@ export function buildXBullTrustlineUrl(asset = DEFAULT_ASSET): string {
 }
 
 export const XBULL_TRUSTLINE_URL = buildXBullTrustlineUrl();
+
+/**
+ * Pagination limits shared by API routes and the cursor helper (issue #792).
+ *
+ * `cursorDefault` is the page size used by `validatePaginationOptions()` when
+ * a caller omits `limit`; `contributorsDefault` is the deliberately smaller
+ * page size used by `/api/contributors/paginated`. `min` and `max` bound
+ * every paginated route, so changing a ceiling is a one-line change here.
+ */
+export const PAGINATION_LIMITS = {
+  cursorDefault: 50,
+  contributorsDefault: 25,
+  min: 1,
+  max: 100,
+} as const;

@@ -7,6 +7,7 @@ import {
   buildInvalidCursorError,
   validatePaginationOptions,
 } from "@/lib/cursor-pagination";
+import { PAGINATION_LIMITS } from "@/lib/constants";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -16,7 +17,7 @@ export const dynamic = "force-dynamic";
  * Supports cursor-based pagination to efficiently handle large datasets.
  *
  * Query params:
- * - limit: number of items per page (default: 25, max: 100)
+ * - limit: number of items per page (default/max from `PAGINATION_LIMITS`)
  * - cursor: cursor from previous page's response
  *
  * Invalid/expired cursors return HTTP 400 with the stable invalid-cursor
@@ -42,10 +43,14 @@ export async function GET(request: NextRequest) {
     return NextResponse.json(buildInvalidCursorError(), { status: 400 });
   }
 
-  let limit = 25;
+  let limit = PAGINATION_LIMITS.contributorsDefault;
   if (limitParam) {
     const parsed = parseInt(limitParam, 10);
-    if (!isNaN(parsed) && parsed > 0 && parsed <= 100) {
+    if (
+      !isNaN(parsed) &&
+      parsed >= PAGINATION_LIMITS.min &&
+      parsed <= PAGINATION_LIMITS.max
+    ) {
       limit = parsed;
     }
   }

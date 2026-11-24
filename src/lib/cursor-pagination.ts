@@ -1,4 +1,5 @@
 import "server-only";
+import { PAGINATION_LIMITS } from "@/lib/constants";
 
 /**
  * Cursor-based pagination configuration
@@ -11,7 +12,8 @@ export interface CursorPaginationOptions {
   cursor?: string;
 
   /**
-   * Maximum number of records to return (default 50, max 100)
+   * Maximum number of records to return (defaults and ceiling live in
+   * `PAGINATION_LIMITS` in `src/lib/constants.ts`).
    */
   limit?: number;
 }
@@ -117,7 +119,13 @@ export function validatePaginationOptions(
   const hasCursor = raw !== undefined && raw !== null && raw !== "";
   const decodedCursor = hasCursor ? decodeCursor(raw as string) : null;
   const invalidCursor = hasCursor && decodedCursor === null;
-  const limit = Math.min(Math.max(options.limit ?? 50, 1), 100);
+  const limit = Math.min(
+    Math.max(
+      options.limit ?? PAGINATION_LIMITS.cursorDefault,
+      PAGINATION_LIMITS.min
+    ),
+    PAGINATION_LIMITS.max
+  );
 
   return { decodedCursor, limit, invalidCursor };
 }

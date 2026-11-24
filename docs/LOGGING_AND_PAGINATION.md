@@ -366,7 +366,7 @@ The dashboard supports cursor-based pagination for efficient handling of large c
 **GET `/api/contributors/paginated`**
 
 Query parameters:
-- `limit` — Number of items per page (default: 25, max: 100)
+- `limit` — Number of items per page (default: 25, max: 100). These are centralized in `PAGINATION_LIMITS` in `src/lib/constants.ts` (issue #792); routes and `validatePaginationOptions()` import them instead of hard-coding limits.
 - `cursor` — Cursor from previous page's `nextCursor` (optional)
 
 **Response:**

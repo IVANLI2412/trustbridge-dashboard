@@ -21,6 +21,7 @@ import { requireMaintainerSession } from "@/lib/api-auth";
 import { prisma } from "@/lib/prisma";
 import { getContributorsPaginated } from "@/lib/registrations";
 import { GET } from "@/app/api/contributors/paginated/route";
+import { PAGINATION_LIMITS } from "@/lib/constants";
 
 function get(url: string) {
   return new NextRequest(url, {
@@ -64,7 +65,7 @@ describe("GET /api/contributors/paginated", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(getContributorsPaginated).toHaveBeenCalledWith(undefined, 25);
+    expect(getContributorsPaginated).toHaveBeenCalledWith(undefined, PAGINATION_LIMITS.contributorsDefault);
     const json = await res.json();
     expect(json.registryMode).toBe("live");
   });
@@ -103,7 +104,7 @@ describe("GET /api/contributors/paginated", () => {
       get("http://localhost:3000/api/contributors/paginated?limit=500")
     );
 
-    expect(getContributorsPaginated).toHaveBeenCalledWith(undefined, 25);
+    expect(getContributorsPaginated).toHaveBeenCalledWith(undefined, PAGINATION_LIMITS.contributorsDefault);
   });
 
   it("returns 400 INVALID_CURSOR for a malformed cursor (no silent page-0 restart)", async () => {
@@ -150,7 +151,7 @@ describe("GET /api/contributors/paginated", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(getContributorsPaginated).toHaveBeenCalledWith(valid, 25);
+    expect(getContributorsPaginated).toHaveBeenCalledWith(valid, PAGINATION_LIMITS.contributorsDefault);
   });
 
   it("treats an empty cursor as the first page", async () => {
@@ -166,6 +167,35 @@ describe("GET /api/contributors/paginated", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(getContributorsPaginated).toHaveBeenCalledWith("", 25);
+    expect(getContributorsPaginated).toHaveBeenCalledWith("", PAGINATION_LIMITS.contributorsDefault);
+  });
+
+  it("honours the shared maximum and rejects limits above it", async () => {
+    vi.mocked(getContributorsPaginated).mockResolvedValue({
+      contributors: [],
+      nextCursor: null,
+      hasMore: false,
+    });
+    vi.mocked(prisma.registration.count).mockResolvedValue(0);
+
+    await GET(
+      get(
+        `http://localhost:3000/api/contributors/paginated?limit=${PAGINATION_LIMITS.max}`
+      )
+    );
+    expect(getContributorsPaginated).toHaveBeenCalledWith(
+      undefined,
+      PAGINATION_LIMITS.max
+    );
+
+    await GET(
+      get(
+        `http://localhost:3000/api/contributors/paginated?limit=${PAGINATION_LIMITS.max + 1}`
+      )
+    );
+    expect(getContributorsPaginated).toHaveBeenLastCalledWith(
+      undefined,
+      PAGINATION_LIMITS.contributorsDefault
+    );
   });
 });
